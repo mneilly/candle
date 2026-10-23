@@ -106,6 +106,27 @@ fn broadcast_matmul_stride_zero_lhs(device: &Device) -> Result<()> {
     Ok(())
 }
 
+// A stride-zero batch dim on the rhs against a transposed lhs, the layout conv_transpose1d uses.
+// The batches of a transposed lhs are not stacked rows, so they cannot be folded into the rows
+// of one matmul.
+fn broadcast_matmul_stride_zero_rhs_transposed_lhs(device: &Device) -> Result<()> {
+    for (b, m, n, k) in [(2, 4, 5, 3), (3, 1, 2, 5), (2, 4, 3, 1), (4, 6, 6, 6)] {
+        let lhs = Tensor::randn(0f32, 1f32, (b, k, m), device)?.transpose(1, 2)?;
+        let rhs = Tensor::randn(0f32, 1f32, (1, k, n), device)?;
+
+        let out = lhs.matmul(&rhs.broadcast_as((b, k, n))?)?;
+        assert_eq!(out.dims(), &[b, m, n]);
+
+        let rhs = rhs.i(0)?;
+        for idx in 0..b {
+            let expected = lhs.i(idx)?.contiguous()?.matmul(&rhs)?;
+            let diff = (out.i(idx)? - expected)?.sqr()?.sum_all()?;
+            assert!(diff.to_vec0::<f32>()? < 1e-6, "batch {idx} differs");
+        }
+    }
+    Ok(())
+}
+
 fn zero_matmul(device: &Device) -> Result<()> {
     let lhs = Tensor::zeros((2, 0), DType::F32, device)?;
     let rhs = Tensor::zeros((0, 3), DType::F32, device)?;
@@ -267,6 +288,12 @@ test_device!(
     broadcast_matmul_stride_zero_lhs_cpu,
     broadcast_matmul_stride_zero_lhs_gpu,
     broadcast_matmul_stride_zero_lhs_metal
+);
+test_device!(
+    broadcast_matmul_stride_zero_rhs_transposed_lhs,
+    broadcast_matmul_stride_zero_rhs_transposed_lhs_cpu,
+    broadcast_matmul_stride_zero_rhs_transposed_lhs_gpu,
+    broadcast_matmul_stride_zero_rhs_transposed_lhs_metal
 );
 test_device!(
     zero_matmul,

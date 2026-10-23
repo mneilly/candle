@@ -113,6 +113,21 @@ fn conv1d_small(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+// Each batch element of a batched conv_transpose1d must match the same element run on its own.
+fn conv_transpose1d_batched(dev: &Device) -> Result<()> {
+    for (l_in, k_size, stride) in [(4, 4, 4), (1, 4, 4), (5, 3, 2)] {
+        let t = Tensor::randn(0f32, 1., (3, 4, l_in), dev)?;
+        let w = Tensor::randn(0f32, 1., (4, 2, k_size), dev)?;
+        let res = t.conv_transpose1d(&w, 0, 0, stride, 1, 1)?;
+        for b in 0..3 {
+            let single = t.i(b..b + 1)?.conv_transpose1d(&w, 0, 0, stride, 1, 1)?;
+            let diff = (res.i(b..b + 1)? - single)?.abs()?.flatten_all()?.max(0)?;
+            assert!(diff.to_vec0::<f32>()? < 1e-5, "batch {b} differs");
+        }
+    }
+    Ok(())
+}
+
 /* This test is based on the following script.
 import torch
 torch.manual_seed(4242)
@@ -981,6 +996,12 @@ test_device!(
     conv1d_small_cpu,
     conv1d_small_gpu,
     conv1d_small_metal
+);
+test_device!(
+    conv_transpose1d_batched,
+    conv_transpose1d_batched_cpu,
+    conv_transpose1d_batched_gpu,
+    conv_transpose1d_batched_metal
 );
 test_device!(conv2d, conv2d_cpu, conv2d_gpu, conv2d_metal);
 test_device!(
