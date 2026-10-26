@@ -146,13 +146,13 @@ impl Config {
 
 /// RMSNorm with a zero-centered weight, `x * rsqrt(mean(x^2) + eps) * (1 + w)`, computed in f32.
 #[derive(Debug, Clone)]
-struct RmsNorm {
+pub(crate) struct RmsNorm {
     weight: Tensor,
     eps: f32,
 }
 
 impl RmsNorm {
-    fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
         let weight = (vb.get(dim, "weight")?.to_dtype(DType::F32)? + 1.)?;
         Ok(Self {
             weight,
@@ -173,19 +173,21 @@ impl Module for RmsNorm {
     }
 }
 
-/// The gated RMSNorm of the Gated DeltaNet output: `rms_norm(x) * w * silu(gate)`.
+/// The gated RMSNorm of the Gated DeltaNet output: `rms_norm(x) * w * act(gate)`.
 #[derive(Debug, Clone)]
 struct RmsNormGated {
     weight: Tensor,
     eps: f32,
+    act: Activation,
 }
 
 impl RmsNormGated {
-    fn new(dim: usize, eps: f64, vb: VarBuilder) -> Result<Self> {
+    fn new(dim: usize, eps: f64, act: Activation, vb: VarBuilder) -> Result<Self> {
         let weight = vb.get(dim, "weight")?.to_dtype(DType::F32)?;
         Ok(Self {
             weight,
             eps: eps as f32,
+            act,
         })
     }
 
@@ -196,13 +198,13 @@ impl RmsNormGated {
             &self.weight,
             self.eps,
         )?;
-        let gate = candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?;
+        let gate = gate.to_dtype(DType::F32)?.apply(&self.act)?;
         (xs * gate)?.to_dtype(dtype)
     }
 }
 
 #[derive(Debug, Clone)]
-struct RotaryEmbedding {
+pub(crate) struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
     rotary_dim: usize,
@@ -211,14 +213,29 @@ struct RotaryEmbedding {
 impl RotaryEmbedding {
     fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let rotary_dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor()) as usize;
-        let theta = cfg.rope_theta();
+        Self::new_partial(
+            dtype,
+            rotary_dim,
+            cfg.rope_theta(),
+            cfg.max_position_embeddings,
+            dev,
+        )
+    }
+
+    /// RoPE over the first `rotary_dim` features of each head.
+    pub(crate) fn new_partial(
+        dtype: DType,
+        rotary_dim: usize,
+        theta: f64,
+        max_seq_len: usize,
+        dev: &Device,
+    ) -> Result<Self> {
         let inv_freq: Vec<_> = (0..rotary_dim)
             .step_by(2)
             .map(|i| 1f32 / theta.powf(i as f64 / rotary_dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
         let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
-        let max_seq_len = cfg.max_position_embeddings;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
@@ -231,12 +248,24 @@ impl RotaryEmbedding {
     }
 
     /// Rotates the first `rotary_dim` features of a `(batch, heads, seq, head_dim)` tensor.
-    fn apply(&self, xs: &Tensor, offset: usize) -> Result<Tensor> {
-        let (_, _, seq_len, head_dim) = xs.dims4()?;
+    pub(crate) fn apply(&self, xs: &Tensor, offset: usize) -> Result<Tensor> {
+        let seq_len = xs.dim(2)?;
         let cos = self.cos.narrow(0, offset, seq_len)?;
         let sin = self.sin.narrow(0, offset, seq_len)?;
+        self.apply_cos_sin(xs, &cos, &sin)
+    }
+
+    /// Like [`Self::apply`], for the positions given as a `(seq,)` u32 tensor.
+    pub(crate) fn apply_at(&self, xs: &Tensor, positions: &Tensor) -> Result<Tensor> {
+        let cos = self.cos.index_select(positions, 0)?;
+        let sin = self.sin.index_select(positions, 0)?;
+        self.apply_cos_sin(xs, &cos, &sin)
+    }
+
+    fn apply_cos_sin(&self, xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let head_dim = xs.dim(D::Minus1)?;
         let rot = xs.narrow(D::Minus1, 0, self.rotary_dim)?.contiguous()?;
-        let rot = candle_nn::rotary_emb::rope(&rot, &cos, &sin)?;
+        let rot = candle_nn::rotary_emb::rope(&rot, cos, sin)?;
         if self.rotary_dim == head_dim {
             return Ok(rot);
         }
@@ -502,9 +531,38 @@ pub fn chunk_gated_delta_rule(
     Ok((out, state))
 }
 
+/// The shapes of a Gated DeltaNet layer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GatedDeltaNetConfig {
+    pub hidden_size: usize,
+    pub num_k_heads: usize,
+    pub num_v_heads: usize,
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    pub conv_kernel: usize,
+    pub rms_norm_eps: f64,
+    /// The activation of the output gate.
+    pub gate_act: Activation,
+}
+
+impl From<&Config> for GatedDeltaNetConfig {
+    fn from(cfg: &Config) -> Self {
+        Self {
+            hidden_size: cfg.hidden_size,
+            num_k_heads: cfg.linear_num_key_heads,
+            num_v_heads: cfg.linear_num_value_heads,
+            head_k_dim: cfg.linear_key_head_dim,
+            head_v_dim: cfg.linear_value_head_dim,
+            conv_kernel: cfg.linear_conv_kernel_dim,
+            rms_norm_eps: cfg.rms_norm_eps,
+            gate_act: cfg.hidden_act,
+        }
+    }
+}
+
 /// The Gated DeltaNet token mixer.
 #[derive(Debug, Clone)]
-struct GatedDeltaNet {
+pub(crate) struct GatedDeltaNet {
     in_proj_qkv: Linear,
     in_proj_z: Linear,
     in_proj_b: Linear,
@@ -527,13 +585,13 @@ struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new(cfg: GatedDeltaNetConfig, vb: VarBuilder) -> Result<Self> {
         let h = cfg.hidden_size;
-        let (nk, nv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads);
-        let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        let (nk, nv) = (cfg.num_k_heads, cfg.num_v_heads);
+        let (dk, dv) = (cfg.head_k_dim, cfg.head_v_dim);
         let (key_dim, value_dim) = (nk * dk, nv * dv);
         let conv_dim = 2 * key_dim + value_dim;
-        let kernel = cfg.linear_conv_kernel_dim;
+        let kernel = cfg.conv_kernel;
         let conv_weight = vb
             .get((conv_dim, 1, kernel), "conv1d.weight")?
             .reshape((conv_dim, kernel))?;
@@ -546,7 +604,7 @@ impl GatedDeltaNet {
             conv_weight,
             a_log: vb.get(nv, "A_log")?.to_dtype(DType::F32)?,
             dt_bias: vb.get(nv, "dt_bias")?.to_dtype(DType::F32)?,
-            norm: RmsNormGated::new(dv, cfg.rms_norm_eps, vb.pp("norm"))?,
+            norm: RmsNormGated::new(dv, cfg.rms_norm_eps, cfg.gate_act, vb.pp("norm"))?,
             num_k_heads: nk,
             num_v_heads: nv,
             head_k_dim: dk,
@@ -577,7 +635,7 @@ impl GatedDeltaNet {
         candle_nn::ops::silu(&ys)
     }
 
-    fn forward(&mut self, xs: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&mut self, xs: &Tensor) -> Result<Tensor> {
         let (b, l, _) = xs.dims3()?;
         let dtype = xs.dtype();
         let (nk, nv, dk, dv) = (
@@ -634,7 +692,7 @@ impl GatedDeltaNet {
         self.out_proj.forward(&out.reshape((b, l, nv * dv))?)
     }
 
-    fn clear_cache(&mut self) {
+    pub(crate) fn clear_cache(&mut self) {
         self.conv_state = None;
         self.recurrent_state = None;
     }
@@ -663,7 +721,7 @@ impl DecoderLayer {
     ) -> Result<Self> {
         let mixer = match layer_type {
             LayerType::LinearAttention => {
-                TokenMixer::Linear(GatedDeltaNet::new(cfg, vb.pp("linear_attn"))?)
+                TokenMixer::Linear(GatedDeltaNet::new(cfg.into(), vb.pp("linear_attn"))?)
             }
             LayerType::FullAttention => {
                 TokenMixer::Full(Attention::new(cfg, rotary, vb.pp("self_attn"))?)

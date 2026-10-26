@@ -12,6 +12,7 @@ use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as Model
 use candle_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
 use candle_transformers::models::qwen3_5::{Config as Config35, Model as Model35};
 use candle_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
+use candle_transformers::models::qwen4_exp::{Config as Config4Exp, Model as Model4Exp, PleTable};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::hub::Api;
@@ -26,6 +27,7 @@ enum Model {
     Base3(Model3),
     Moe3(ModelMoe3),
     Base35(Model35),
+    Qwen4Exp(Model4Exp),
 }
 
 impl Model {
@@ -36,6 +38,7 @@ impl Model {
             Self::Base3(ref mut m) => m.forward(xs, s),
             Self::Moe3(ref mut m) => m.forward(xs, s),
             Self::Base35(ref mut m) => m.forward(xs, s),
+            Self::Qwen4Exp(ref mut m) => m.forward(xs, s),
         }
     }
 }
@@ -179,6 +182,8 @@ enum WhichModel {
     W35_27b,
     #[value(name = "3.8-27b")]
     W38_27b,
+    #[value(name = "3.8-flash-next")]
+    W38FlashNext,
 }
 
 #[derive(Parser, Debug)]
@@ -254,6 +259,7 @@ impl Args {
                 | WhichModel::W3MoeA3b
                 | WhichModel::W35_27b
                 | WhichModel::W38_27b
+                | WhichModel::W38FlashNext
         ) && !self.no_chat_template
     }
 }
@@ -267,7 +273,10 @@ fn format_prompt(
     if !use_chat_template {
         return prompt.to_string();
     }
-    if matches!(model, WhichModel::W35_27b | WhichModel::W38_27b) {
+    if matches!(
+        model,
+        WhichModel::W35_27b | WhichModel::W38_27b | WhichModel::W38FlashNext
+    ) {
         // Qwen3.5 and later have no /think switch: thinking is skipped by opening the assistant
         // turn with an empty think block.
         let think = if thinking {
@@ -333,6 +342,7 @@ fn main() -> Result<()> {
                 WhichModel::W3MoeA3b => ("3", "30B-A3B"),
                 WhichModel::W35_27b => ("3.5", "27B"),
                 WhichModel::W38_27b => ("3.8", "27B"),
+                WhichModel::W38FlashNext => ("3.8", "Flash-Next"),
             };
             format!("Qwen/Qwen{version}-{size}")
         }
@@ -381,7 +391,8 @@ fn main() -> Result<()> {
             | WhichModel::W3_8b
             | WhichModel::W3MoeA3b
             | WhichModel::W35_27b
-            | WhichModel::W38_27b => {
+            | WhichModel::W38_27b
+            | WhichModel::W38FlashNext => {
                 candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
             }
         },
@@ -413,6 +424,21 @@ fn main() -> Result<()> {
         WhichModel::W35_27b | WhichModel::W38_27b => {
             let config = Config35::from_json(&std::fs::read_to_string(config_file)?)?;
             Model::Base35(Model35::new(&config, vb)?)
+        }
+        WhichModel::W38FlashNext => {
+            let config = Config4Exp::from_json(&std::fs::read_to_string(config_file)?)?;
+            // The n-gram embedding tables hold 51B parameters: leave them memory-mapped on the
+            // host and read only the rows each step needs.
+            let st = std::sync::Arc::new(unsafe {
+                candle::safetensors::MmapedSafetensors::multi(&filenames)?
+            });
+            let prefix = Model4Exp::weight_prefix(&vb);
+            let tables = config
+                .ple_layer_ids
+                .iter()
+                .map(|&id| PleTable::from_mmaped(st.clone(), prefix, id - 1))
+                .collect::<candle::Result<Vec<_>>>()?;
+            Model::Qwen4Exp(Model4Exp::new_with_ple_tables(&config, vb, tables)?)
         }
         _ => {
             let config: ConfigBase = serde_json::from_slice(&std::fs::read(config_file)?)?;

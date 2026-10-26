@@ -69,3 +69,17 @@ $ cargo run --example qwen --features cuda --release -- --model 3.8-27b --prompt
 The 27B models need about 54GB of GPU memory in bf16. As for Qwen3, the prompt is wrapped in the
 chat template unless `--no-chat-template` is passed, and `--thinking` lets the model reason before
 answering.
+
+## Qwen3.8-Flash-Next
+
+Qwen3.8-Flash-Next previews the Qwen4 architecture: a 125B-parameter mixture of experts with 6B
+active parameters per token. On top of the Gated DeltaNet hybrid, it widens the residual stream
+into four gated streams, makes the full-attention layers sparse with Qwen Sparse Attention, and
+adds a 51B-parameter hashed n-gram embedding on one layer. Only the text model is supported.
+
+```bash
+$ cargo run --example qwen --features cuda --release -- --model 3.8-flash-next --prompt "Explain the delta rule."
+```
+
+The n-gram embedding table stays memory-mapped on the host, and only the rows each step needs
+are read from it. The rest of the model, about 250GB in bf16, is loaded on the device.
