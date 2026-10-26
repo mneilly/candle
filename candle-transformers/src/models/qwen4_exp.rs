@@ -625,18 +625,14 @@ impl QsaIndexer {
         let mut mask = vec![f32::NEG_INFINITY; b * l * kv_len];
         for (bi, batch_scores) in scores.iter().enumerate() {
             for (t, row) in batch_scores.iter().enumerate() {
-                let pos = offset + t;
-                let complete = (pos + 1) / ratio;
                 let base = (bi * l + t) * kv_len;
-                let mut blocks: Vec<usize> = (0..complete).collect();
-                if complete > block_topk {
-                    blocks.sort_by(|&x, &y| row[y].total_cmp(&row[x]).then(x.cmp(&y)));
-                    blocks.truncate(block_topk);
-                }
-                for j in blocks {
-                    mask[base + j * ratio..base + (j + 1) * ratio].fill(0.);
-                }
-                mask[base + complete * ratio..base + pos + 1].fill(0.);
+                qsa_keep(
+                    row,
+                    offset + t,
+                    ratio,
+                    block_topk,
+                    &mut mask[base..base + kv_len],
+                );
             }
         }
         let mask = Tensor::from_vec(mask, (b, 1, l, kv_len), dev)?;
@@ -646,6 +642,23 @@ impl QsaIndexer {
     fn clear_cache(&mut self) {
         self.raw_keys = None
     }
+}
+
+/// Zeroes the entries of `mask`, the additive mask row of the query at position `pos`, for the
+/// keys it attends to under QSA: the tokens of its `block_topk` highest-scoring complete blocks of
+/// `ratio` tokens (ties going to the earlier block), and its incomplete tail block. `scores` holds
+/// one score per complete block of the whole key sequence.
+fn qsa_keep(scores: &[f32], pos: usize, ratio: usize, block_topk: usize, mask: &mut [f32]) {
+    let complete = (pos + 1) / ratio;
+    let mut blocks: Vec<usize> = (0..complete).collect();
+    if complete > block_topk {
+        blocks.sort_by(|&x, &y| scores[y].total_cmp(&scores[x]).then(x.cmp(&y)));
+        blocks.truncate(block_topk);
+    }
+    for j in blocks {
+        mask[j * ratio..(j + 1) * ratio].fill(0.);
+    }
+    mask[complete * ratio..pos + 1].fill(0.);
 }
 
 /// Full attention with an output gate, QK-norm, partial RoPE and optional QSA sparsity.
@@ -1382,5 +1395,111 @@ mod tests {
         ];
         let rows: Vec<u64> = rows.iter().map(|&r| r as u64).collect();
         assert_eq!(rows, expected);
+    }
+}
+
+/// Bounded proofs of the QSA selection and the n-gram hashing, run with
+/// `cargo kani -p candle-transformers`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// QSA never lets a query see a future token, always keeps the tail block, keeps whole
+    /// blocks, and keeps exactly the `block_topk` best-scoring complete blocks.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn qsa_keeps_the_top_past_blocks_and_the_tail() {
+        const KV: usize = 8;
+        let ratio: usize = kani::any();
+        let block_topk: usize = kani::any();
+        let pos: usize = kani::any();
+        kani::assume((1..=4).contains(&ratio) && block_topk <= 2 && pos < KV);
+        let scores: [f32; KV] = kani::any();
+        let mut mask = [f32::NEG_INFINITY; KV];
+        qsa_keep(&scores, pos, ratio, block_topk, &mut mask);
+
+        let kept = |j: usize| mask[j] == 0.;
+        let complete = (pos + 1) / ratio;
+        for j in 0..KV {
+            if kept(j) {
+                assert!(j <= pos, "a future token is visible");
+            }
+        }
+        for j in complete * ratio..=pos {
+            assert!(kept(j), "the tail block is dropped");
+        }
+        let mut n_kept = 0;
+        for b in 0..complete {
+            for j in b * ratio..(b + 1) * ratio {
+                assert_eq!(kept(j), kept(b * ratio), "a block is split");
+            }
+            if kept(b * ratio) {
+                n_kept += 1;
+                for c in 0..complete {
+                    if !kept(c * ratio) {
+                        // A kept block scores at least as high as a dropped one, and wins ties
+                        // only by coming first.
+                        let ord = scores[b].total_cmp(&scores[c]);
+                        assert!(ord.is_gt() || (ord.is_eq() && b < c));
+                    }
+                }
+            }
+        }
+        assert_eq!(n_kept, complete.min(block_topk));
+    }
+
+    fn tiny_hash() -> NgramHash {
+        // Odd multipliers below 2^63 / 50 as the reference derives for a 50-token vocabulary,
+        // two heads per n-gram order, and the first primes from 200 as head vocabularies.
+        NgramHash {
+            multipliers: vec![3612826517417929, 34937402946437465, 61226416566306291],
+            head_vocab_sizes: vec![211, 223, 227, 229],
+            head_offsets: vec![0, 211, 434, 661],
+            rows: 896,
+        }
+    }
+
+    /// Every row a token gathers lies in the range of its head.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn ngram_rows_stay_in_their_head() {
+        let hash = tiny_hash();
+        let context: [u32; 2] = [kani::any(), kani::any()];
+        let ids: [u32; 2] = [kani::any(), kani::any()];
+        kani::assume(context.iter().chain(ids.iter()).all(|&t| t < 50));
+        let rows = hash.rows(&context, &ids, 2, 3);
+        assert_eq!(rows.len(), 2 * 4);
+        for (k, &row) in rows.iter().enumerate() {
+            let h = k % 4;
+            let row = row as u64;
+            assert!(row >= hash.head_offsets[h]);
+            assert!(row < hash.head_offsets[h] + hash.head_vocab_sizes[h]);
+            assert!(row < hash.rows);
+        }
+    }
+
+    /// After an end-of-text token, the rows only depend on the tokens that follow it.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn ngram_window_resets_after_eos() {
+        let hash = tiny_hash();
+        let eos = 3;
+        let (a, b): (u32, u32) = (kani::any(), kani::any());
+        let (x, y): (u32, u32) = (kani::any(), kani::any());
+        kani::assume([a, b, x, y].iter().all(|&t| t < 50));
+        let rows_1 = hash.rows(&[a, b], &[eos, x, y], 2, eos);
+        let rows_2 = hash.rows(&[b, a], &[eos, x, y], 2, eos);
+        // Positions 1 and 2 follow the EOS at position 0.
+        assert_eq!(rows_1[4..], rows_2[4..]);
+    }
+
+    /// `is_prime` agrees with trial division by every smaller number.
+    #[kani::proof]
+    #[kani::unwind(130)]
+    fn is_prime_is_trial_division() {
+        let v: u64 = kani::any();
+        kani::assume(v < 128);
+        let naive = v >= 2 && (2..v).all(|d| v % d != 0);
+        assert_eq!(is_prime(v), naive);
     }
 }

@@ -146,9 +146,8 @@ impl Scheduler {
                 };
             }
         } else {
-            let shift = cfg.shift;
             for s in sigmas.iter_mut() {
-                *s = shift * *s / (1. + (shift - 1.) * *s);
+                *s = fixed_shift(*s, cfg.shift);
             }
         }
         if let Some(terminal) = cfg.shift_terminal {
@@ -178,6 +177,11 @@ impl Scheduler {
         let dtype = latents.dtype();
         (latents.to_dtype(DType::F32)? + (velocity.to_dtype(DType::F32)? * dt)?)?.to_dtype(dtype)
     }
+}
+
+/// The resolution-independent schedule shift, `shift * s / (1 + (shift - 1) * s)`.
+fn fixed_shift(s: f64, shift: f64) -> f64 {
+    shift * s / (1. + (shift - 1.) * s)
 }
 
 /// `(batch, channels, height, width)` -> `(batch, height * width, channels)`.
@@ -574,5 +578,24 @@ mod tests {
             ..Default::default()
         };
         assert!(Vae::new(&same, vb).is_ok());
+    }
+}
+
+/// Bounded proofs of the schedule arithmetic, run with `cargo kani -p candle-transformers`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// The fixed shift keeps noise levels in `[0, 1]` and in order, rounding included.
+    #[kani::proof]
+    fn fixed_shift_is_monotone_in_unit_interval() {
+        let s: f64 = kani::any();
+        let t: f64 = kani::any();
+        let shift: f64 = kani::any();
+        kani::assume((0. ..=1.).contains(&s) && (0. ..=1.).contains(&t) && s <= t);
+        kani::assume((0.5..=10.).contains(&shift));
+        let (fs, ft) = (fixed_shift(s, shift), fixed_shift(t, shift));
+        assert!((0. ..=1.).contains(&fs) && (0. ..=1.).contains(&ft));
+        assert!(fs <= ft);
     }
 }

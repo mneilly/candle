@@ -384,30 +384,42 @@ fn rope_cos_sin(
 /// The matrix of `F.interpolate(mode="linear", align_corners=False)` from `src` to `dst` steps.
 fn linear_interp_matrix(src: usize, dst: usize) -> Vec<f32> {
     let mut m = vec![0f32; dst * src];
-    let scale = src as f64 / dst as f64;
     for i in 0..dst {
-        let pos = (scale * (i as f64 + 0.5) - 0.5).max(0.);
-        let i0 = pos.floor() as usize;
-        let i1 = if i0 + 1 < src { i0 + 1 } else { i0 };
-        let w1 = (pos - i0 as f64) as f32;
+        let (i0, i1, w1) = linear_taps(i, src, dst);
+        let w1 = w1 as f32;
         m[i * src + i0] += 1. - w1;
         m[i * src + i1] += w1;
     }
     m
 }
 
+/// The two source steps that output step `i` of a linear interpolation from `src` to `dst`
+/// steps (`align_corners=False`) blends, and the weight of the second.
+fn linear_taps(i: usize, src: usize, dst: usize) -> (usize, usize, f64) {
+    let scale = src as f64 / dst as f64;
+    let pos = (scale * (i as f64 + 0.5) - 0.5).max(0.);
+    let i0 = pos.floor() as usize;
+    let i1 = if i0 + 1 < src { i0 + 1 } else { i0 };
+    (i0, i1, pos - i0 as f64)
+}
+
 /// The matrix of `F.interpolate(mode="area")`, i.e. adaptive average pooling, from `src` to `dst`.
 fn area_interp_matrix(src: usize, dst: usize) -> Vec<f32> {
     let mut m = vec![0f32; dst * src];
     for i in 0..dst {
-        let start = i * src / dst;
-        let end = ((i + 1) * src).div_ceil(dst);
+        let (start, end) = area_window(i, src, dst);
         let w = 1. / (end - start) as f32;
         for j in start..end {
             m[i * src + j] = w;
         }
     }
     m
+}
+
+/// The source window `[start, end)` that output step `i` of an area interpolation from `src` to
+/// `dst` steps averages.
+fn area_window(i: usize, src: usize, dst: usize) -> (usize, usize) {
+    (i * src / dst, ((i + 1) * src).div_ceil(dst))
 }
 
 /// `numpy.linspace(start, end, n)`.
@@ -1492,5 +1504,60 @@ mod tests {
         cfg.vqvae.vector_quantizer_config.levels.manual_levels = vec![3, 4, 8, 16];
         let err = random_model(&cfg).unwrap_err().to_string();
         assert!(err.contains("divisible"), "{err}");
+    }
+}
+
+/// Bounded proofs of the index arithmetic, run with `cargo kani -p candle-transformers`.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// The cascade strides multiply back to the total stride, and each is a real stride.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn cascade_strides_multiply_to_total() {
+        let total: usize = kani::any();
+        let base: usize = kani::any();
+        kani::assume((1..=64).contains(&total) && (2..=8).contains(&base));
+        let strides = plan_cascade_strides(total, base);
+        assert!(!strides.is_empty());
+        assert_eq!(strides.iter().product::<usize>(), total);
+        if total > 1 {
+            assert!(strides.iter().all(|&s| s > 1));
+        }
+    }
+
+    /// Area windows are non-empty, in bounds, start at 0, end at `src`, and leave no gap
+    /// between consecutive outputs.
+    #[kani::proof]
+    fn area_windows_cover_the_source() {
+        let src: usize = kani::any();
+        let dst: usize = kani::any();
+        let i: usize = kani::any();
+        kani::assume((1..=256).contains(&src) && (1..=256).contains(&dst) && i < dst);
+        let (start, end) = area_window(i, src, dst);
+        assert!(start < end && end <= src);
+        if i == 0 {
+            assert_eq!(start, 0);
+        }
+        if i + 1 == dst {
+            assert_eq!(end, src);
+        } else {
+            let (next_start, _) = area_window(i + 1, src, dst);
+            assert!(next_start <= end && next_start >= start);
+        }
+    }
+
+    /// Linear taps are in bounds and adjacent, with a weight in `[0, 1]`.
+    #[kani::proof]
+    fn linear_taps_are_in_bounds() {
+        let src: usize = kani::any();
+        let dst: usize = kani::any();
+        let i: usize = kani::any();
+        kani::assume((1..=256).contains(&src) && (1..=256).contains(&dst) && i < dst);
+        let (i0, i1, w1) = linear_taps(i, src, dst);
+        assert!(i0 < src && i1 < src);
+        assert!(i1 == i0 || i1 == i0 + 1);
+        assert!((0. ..=1.).contains(&w1));
     }
 }
