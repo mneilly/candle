@@ -246,6 +246,16 @@ impl Config {
             .unwrap_or(10_000.)
     }
 
+    /// The one-indexed ids of the n-gram embedding layers, sorted and deduplicated as the
+    /// reference does when loading the config. A layer's hash constants depend on its position
+    /// in this list.
+    pub fn ple_layers(&self) -> Vec<usize> {
+        let mut ids = self.ple_layer_ids.clone();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     fn ple_embed_dim(&self) -> usize {
         self.ple_embed_dim.unwrap_or(self.hidden_size)
     }
@@ -1227,8 +1237,8 @@ impl Model {
         Self::new_with_ple_tables(cfg, vb, vec![])
     }
 
-    /// Loads the model with the given n-gram embedding tables, in the order of
-    /// `cfg.ple_layer_ids`. Layers without a table read theirs through `vb`.
+    /// Loads the model with the given n-gram embedding tables, one per layer of
+    /// [`Config::ple_layers`] and in that order. Layers without a table read theirs through `vb`.
     pub fn new_with_ple_tables(
         cfg: &Config,
         vb: VarBuilder,
@@ -1252,14 +1262,14 @@ impl Model {
                 cfg.num_hidden_layers
             )
         }
-        let mut tables = tables.into_iter();
+        let ple_ids = cfg.ple_layers();
+        let mut tables: Vec<Option<PleTable>> = tables.into_iter().map(Some).collect();
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for (i, &t) in layer_types.iter().enumerate() {
-            let ple = cfg
-                .ple_layer_ids
+            let ple = ple_ids
                 .iter()
                 .position(|&id| id == i + 1)
-                .map(|index| (index, tables.next()));
+                .map(|index| (index, tables.get_mut(index).and_then(Option::take)));
             let vb_l = vb_m.pp("layers").pp(i);
             layers.push(DecoderLayer::new(cfg, t, ple, rotary.clone(), vb_l)?);
         }

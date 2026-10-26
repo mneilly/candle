@@ -353,6 +353,14 @@ fn layer_norm(size: usize, bias: bool, vb: VarBuilder) -> Result<LayerNorm> {
     }
 }
 
+/// Reads a scalar parameter as f64, on the host since some devices have no f64 support.
+fn read_scalar(vb: &VarBuilder, name: &str) -> Result<f64> {
+    vb.get((), name)?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F64)?
+        .to_scalar::<f64>()
+}
+
 /// Rotary embedding tables for the given positions, in the half-split (GPT-NeoX) layout.
 fn rope_cos_sin(
     positions: &[u32],
@@ -652,8 +660,7 @@ impl Quantizer {
                         ..Default::default()
                     };
                     let ratio = if r.learnable_ratio {
-                        let logit = vb.get((), "ratio_logit")?.to_dtype(DType::F64)?;
-                        let logit = logit.to_scalar::<f64>()?;
+                        let logit = read_scalar(&vb, "ratio_logit")?;
                         1. / (1. + (-logit).exp())
                     } else {
                         r.ratio.abs()
@@ -862,12 +869,8 @@ impl Head {
     fn tied(cfg: &GeneratorConfig, codebook: &Tensor, vb: VarBuilder) -> Result<Self> {
         let (vocab, dim) = codebook.dims2()?;
         let proj = linear_b(cfg.n_embd, dim, false, vb.pp("proj"))?;
-        let codebook = if cfg.tie_heads_trainable {
-            vb.get((vocab, dim), "E")?
-        } else {
-            codebook.clone()
-        };
-        // d_scale is computed from the frozen codebook the head was built from.
+        // d_scale is computed from the frozen codebook the head was built from, even when the
+        // head trains its own copy E.
         let d_scale = codebook
             .to_dtype(DType::F32)?
             .sqr()?
@@ -875,10 +878,13 @@ impl Head {
             .mean_all()?
             .to_scalar::<f32>()?
             .max(1e-12) as f64;
+        let codebook = if cfg.tie_heads_trainable {
+            vb.get((vocab, dim), "E")?
+        } else {
+            codebook.clone()
+        };
         let log_inv_t = if cfg.tie_heads_learn_scale {
-            vb.get((), "log_inv_T")?
-                .to_dtype(DType::F64)?
-                .to_scalar::<f64>()?
+            read_scalar(&vb, "log_inv_T")?
         } else {
             0.
         };

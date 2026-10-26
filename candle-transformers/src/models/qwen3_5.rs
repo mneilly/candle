@@ -494,18 +494,22 @@ pub fn chunk_gated_delta_rule(
     let intra = (q.contiguous()?.matmul(&k_t)? * &pairwise)?;
     let decayed_k_beta = k_beta.broadcast_mul(&cum_exp)?;
 
-    // Invert the unit lower-triangular system (I + strict_lower(ut_system)) by forward
-    // substitution, one row at a time.
+    // Invert the unit lower-triangular system I + L, L = strict_lower(ut_system). With
+    // a = -L nilpotent (a^c = 0), (I - a)^-1 = I + a + ... + a^(c-1) = (I + a)(I + a^2)(I + a^4)...,
+    // which takes about 2 log2(c) matmuls.
     let strict_lower = Tensor::tril2(c, DType::F32, dev)?.sub(&Tensor::eye(c, DType::F32, dev)?)?;
+    let eye = Tensor::eye(c, DType::F32, dev)?;
     let a = ut_system.broadcast_mul(&strict_lower)?.neg()?;
-    let mut rows = vec![a.narrow(2, 0, 1)?];
-    for i in 1..c {
-        let row = a.narrow(2, i, 1)?;
-        let prev = Tensor::cat(&rows, 2)?;
-        let update = row.narrow(3, 0, i)?.contiguous()?.matmul(&prev)?;
-        rows.push((row + update)?);
+    let mut inv = a.broadcast_add(&eye)?;
+    let mut power = a.matmul(&a)?;
+    let mut span = 2;
+    while span < c {
+        inv = inv.matmul(&power.broadcast_add(&eye)?)?;
+        span *= 2;
+        if span < c {
+            power = power.matmul(&power)?;
+        }
     }
-    let inv = Tensor::cat(&rows, 2)?.broadcast_add(&Tensor::eye(c, DType::F32, dev)?)?;
     let new_values = inv.matmul(&v_beta.contiguous()?)?;
     let k_cumdecay = inv.matmul(&decayed_k_beta.contiguous()?)?;
 

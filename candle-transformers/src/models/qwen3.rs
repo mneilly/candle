@@ -463,8 +463,8 @@ impl Model {
     }
 
     /// Runs the model as an encoder over a right-padded batch and returns the hidden states
-    /// after each of the first `layers[i]` decoder layers, before the final norm. This matches
-    /// `hidden_states[layers[i]]` in transformers.
+    /// after each of the first `layers[i]` decoder layers, as `hidden_states[layers[i]]` in
+    /// transformers: requesting `num_hidden_layers` gives the final-normed output.
     ///
     /// `attention_mask` is `(B, L)`, non-zero for real tokens: padded keys are masked out, on top
     /// of the causal mask. The KV cache is neither read nor written.
@@ -474,41 +474,21 @@ impl Model {
         attention_mask: Option<&Tensor>,
         layers: &[usize],
     ) -> Result<Vec<Tensor>> {
-        let (b, l) = input.dims2()?;
-        let mask = crate::utils::build_additive_causal_mask(l, 0, None, &self.device, DType::F32)?
-            .reshape((1, 1, l, l))?;
-        let mask = match attention_mask {
-            Some(am) => {
-                let neg_inf = Tensor::full(f32::NEG_INFINITY, (b, l), &self.device)?;
-                let pad = am
-                    .eq(0u32)?
-                    .where_cond(&neg_inf, &neg_inf.zeros_like()?)?
-                    .reshape((b, 1, 1, l))?;
-                mask.broadcast_add(&pad)?
-            }
-            None => mask,
-        };
-        let mask = mask.to_dtype(self.dtype)?;
-        let last = layers.iter().copied().max().unwrap_or(0);
-        if last > self.layers.len() {
-            candle::bail!(
-                "layer {last} requested from a {}-layer model",
-                self.layers.len()
-            )
-        }
-        let mut h = self.embed_tokens.forward(input)?;
-        let mut outs = vec![None; layers.len()];
-        for idx in 0..=last {
-            for (o, &want) in outs.iter_mut().zip(layers.iter()) {
-                if want == idx {
-                    *o = Some(h.clone())
-                }
-            }
-            if idx < last {
-                h = self.layers[idx].forward_with_mask(&h, &mask)?;
-            }
-        }
-        Ok(outs.into_iter().map(|o| o.unwrap()).collect())
+        let (_, l) = input.dims2()?;
+        let mask = crate::utils::build_padded_causal_mask(
+            attention_mask,
+            l,
+            None,
+            &self.device,
+            self.dtype,
+        )?;
+        crate::utils::collect_hidden_states(
+            self.embed_tokens.forward(input)?,
+            self.layers.len(),
+            layers,
+            |idx, h| self.layers[idx].forward_with_mask(h, &mask),
+            |h| self.norm.forward(h),
+        )
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {

@@ -159,8 +159,12 @@ impl Modulation {
 
 /// RoPE tables for the given `(seq, axes)` position ids: one block of frequencies per axis, in
 /// the interleaved (GPT-J) layout. Returns `(cos, sin)`, each `(seq, head_dim / 2)` in f32.
+///
+/// The frequencies are computed in f64 on the host, as some devices have no f64 support, and the
+/// tables are returned on the device of `ids`.
 pub fn rope_tables(ids: &Tensor, axes_dims: &[usize], theta: f64) -> Result<(Tensor, Tensor)> {
-    let ids = ids.to_dtype(DType::F64)?;
+    let device = ids.device().clone();
+    let ids = ids.to_device(&Device::Cpu)?.to_dtype(DType::F64)?;
     let mut freqs = Vec::with_capacity(axes_dims.len());
     for (axis, &dim) in axes_dims.iter().enumerate() {
         let inv: Vec<f64> = (0..dim)
@@ -173,8 +177,8 @@ pub fn rope_tables(ids: &Tensor, axes_dims: &[usize], theta: f64) -> Result<(Ten
     }
     let freqs = Tensor::cat(&freqs, 1)?;
     Ok((
-        freqs.cos()?.to_dtype(DType::F32)?,
-        freqs.sin()?.to_dtype(DType::F32)?,
+        freqs.cos()?.to_dtype(DType::F32)?.to_device(&device)?,
+        freqs.sin()?.to_dtype(DType::F32)?.to_device(&device)?,
     ))
 }
 

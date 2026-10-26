@@ -434,7 +434,7 @@ fn main() -> Result<()> {
             });
             let prefix = Model4Exp::weight_prefix(&vb);
             let tables = config
-                .ple_layer_ids
+                .ple_layers()
                 .iter()
                 .map(|&id| PleTable::from_mmaped(st.clone(), prefix, id - 1))
                 .collect::<candle::Result<Vec<_>>>()?;

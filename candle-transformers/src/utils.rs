@@ -65,6 +65,66 @@ pub fn build_additive_causal_mask(
     Tensor::from_slice(&mask, (1, 1, tgt, tgt + offset), device)?.to_dtype(dtype)
 }
 
+/// Build an additive causal mask of shape `(b, 1, l, l)` for a right-padded batch: on top of
+/// the causal (and optional sliding-window) mask, keys where the `(b, l)` `attention_mask` is
+/// zero are masked out. With no `attention_mask` this is [`build_additive_causal_mask`].
+pub fn build_padded_causal_mask(
+    attention_mask: Option<&Tensor>,
+    l: usize,
+    sw: Option<usize>,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let mask = build_additive_causal_mask(l, 0, sw, device, DType::F32)?;
+    let mask = match attention_mask {
+        Some(am) => {
+            let b = am.dim(0)?;
+            let neg_inf = Tensor::full(f32::NEG_INFINITY, (b, l), device)?;
+            let pad = am
+                .eq(0u32)?
+                .where_cond(&neg_inf, &neg_inf.zeros_like()?)?
+                .reshape((b, 1, 1, l))?;
+            mask.broadcast_add(&pad)?
+        }
+        None => mask,
+    };
+    mask.to_dtype(dtype)
+}
+
+/// Selects hidden states as transformers' `output_hidden_states` does: entry `0` is the input
+/// embeddings, entry `i` the output of the first `i` layers, and the last entry (`n_layers`)
+/// has the final norm applied. `layer` runs decoder layer `idx` and `final_norm` the norm.
+pub fn collect_hidden_states(
+    embeds: Tensor,
+    n_layers: usize,
+    layers: &[usize],
+    mut layer: impl FnMut(usize, &Tensor) -> Result<Tensor>,
+    final_norm: impl Fn(&Tensor) -> Result<Tensor>,
+) -> Result<Vec<Tensor>> {
+    let last = layers.iter().copied().max().unwrap_or(0);
+    if last > n_layers {
+        candle::bail!("hidden state {last} requested from a {n_layers}-layer model")
+    }
+    let mut h = embeds;
+    let mut outs = vec![None; layers.len()];
+    for idx in 0..=last {
+        let state = if idx == n_layers {
+            final_norm(&h)?
+        } else {
+            h.clone()
+        };
+        for (o, &want) in outs.iter_mut().zip(layers.iter()) {
+            if want == idx {
+                *o = Some(state.clone())
+            }
+        }
+        if idx < last {
+            h = layer(idx, &h)?;
+        }
+    }
+    Ok(outs.into_iter().flatten().collect())
+}
+
 pub fn apply_repeat_penalty(logits: &Tensor, penalty: f32, context: &[u32]) -> Result<Tensor> {
     let device = logits.device();
     let mut logits = logits.to_dtype(candle::DType::F32)?.to_vec1::<f32>()?;
