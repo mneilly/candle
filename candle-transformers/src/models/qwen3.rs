@@ -184,12 +184,8 @@ impl Qwen3Attention {
         })
     }
 
-    pub(crate) fn forward(
-        &mut self,
-        x: &Tensor,
-        attn_mask: Option<&Tensor>,
-        offset: usize,
-    ) -> Result<Tensor> {
+    /// Projects `x` to rotated, normed queries and keys, and values, all `(B, H, L, D)`.
+    fn qkv(&self, x: &Tensor, offset: usize) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, l, _) = x.dims3()?;
 
         // 1. Proj
@@ -218,6 +214,25 @@ impl Qwen3Attention {
 
         // 4. RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+        Ok((q, k, v))
+    }
+
+    /// Attention over `x` alone with an explicit additive mask, bypassing the KV cache. Used to
+    /// run the model as an encoder over padded batches.
+    pub(crate) fn forward_with_mask(&self, x: &Tensor, attn_mask: &Tensor) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let (q, k, v) = self.qkv(x, 0)?;
+        self.forward_standard_attn(&q, &k, &v.contiguous()?, Some(attn_mask), b, l)
+    }
+
+    pub(crate) fn forward(
+        &mut self,
+        x: &Tensor,
+        attn_mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let (q, k, v) = self.qkv(x, offset)?;
 
         // 5. Accumulate KV cache
         let (k, v) = self.kv_cache.append(&k, &v)?;
@@ -391,6 +406,15 @@ impl DecoderLayer {
         x + h2
     }
 
+    fn forward_with_mask(&self, x: &Tensor, mask: &Tensor) -> Result<Tensor> {
+        let h = self.ln1.forward(x)?;
+        let h = self.self_attn.forward_with_mask(&h, mask)?;
+        let x = (x + h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = h2.apply(&self.mlp)?;
+        x + h2
+    }
+
     fn clear_kv_cache(&mut self) {
         self.self_attn.clear_kv_cache();
     }
@@ -436,6 +460,55 @@ impl Model {
         for l in &mut self.layers {
             l.clear_kv_cache();
         }
+    }
+
+    /// Runs the model as an encoder over a right-padded batch and returns the hidden states
+    /// after each of the first `layers[i]` decoder layers, before the final norm. This matches
+    /// `hidden_states[layers[i]]` in transformers.
+    ///
+    /// `attention_mask` is `(B, L)`, non-zero for real tokens: padded keys are masked out, on top
+    /// of the causal mask. The KV cache is neither read nor written.
+    pub fn forward_hidden_states(
+        &self,
+        input: &Tensor,
+        attention_mask: Option<&Tensor>,
+        layers: &[usize],
+    ) -> Result<Vec<Tensor>> {
+        let (b, l) = input.dims2()?;
+        let mask = crate::utils::build_additive_causal_mask(l, 0, None, &self.device, DType::F32)?
+            .reshape((1, 1, l, l))?;
+        let mask = match attention_mask {
+            Some(am) => {
+                let neg_inf = Tensor::full(f32::NEG_INFINITY, (b, l), &self.device)?;
+                let pad = am
+                    .eq(0u32)?
+                    .where_cond(&neg_inf, &neg_inf.zeros_like()?)?
+                    .reshape((b, 1, 1, l))?;
+                mask.broadcast_add(&pad)?
+            }
+            None => mask,
+        };
+        let mask = mask.to_dtype(self.dtype)?;
+        let last = layers.iter().copied().max().unwrap_or(0);
+        if last > self.layers.len() {
+            candle::bail!(
+                "layer {last} requested from a {}-layer model",
+                self.layers.len()
+            )
+        }
+        let mut h = self.embed_tokens.forward(input)?;
+        let mut outs = vec![None; layers.len()];
+        for idx in 0..=last {
+            for (o, &want) in outs.iter_mut().zip(layers.iter()) {
+                if want == idx {
+                    *o = Some(h.clone())
+                }
+            }
+            if idx < last {
+                h = self.layers[idx].forward_with_mask(&h, &mask)?;
+            }
+        }
+        Ok(outs.into_iter().map(|o| o.unwrap()).collect())
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {

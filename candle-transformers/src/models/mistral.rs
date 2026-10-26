@@ -363,7 +363,8 @@ pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    /// `None` for a model loaded with [`Model::new_text_encoder`].
+    lm_head: Option<Linear>,
     sliding_window: Option<usize>,
     device: Device,
     dtype: DType,
@@ -371,10 +372,26 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let vb_m = vb.pp("model");
+        let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        Self::new_inner(cfg, vb.pp("model"), Some(lm_head))
+    }
+
+    /// Loads the decoder without its language-model head, from `vb` pointing at the module that
+    /// holds `embed_tokens`, `layers` and `norm`. Such a model only supports
+    /// [`Model::forward_hidden_states`].
+    pub fn new_text_encoder(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        // Flash attention takes no padding mask.
+        let cfg = Config {
+            use_flash_attn: false,
+            ..cfg.clone()
+        };
+        Self::new_inner(&cfg, vb, None)
+    }
+
+    fn new_inner(cfg: &Config, vb_m: VarBuilder, lm_head: Option<Linear>) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
-        let rotary_emb = Arc::new(RotaryEmbedding::new(vb.dtype(), cfg, vb_m.device())?);
+        let rotary_emb = Arc::new(RotaryEmbedding::new(vb_m.dtype(), cfg, vb_m.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers {
@@ -382,16 +399,75 @@ impl Model {
             layers.push(layer)
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
-        let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
             sliding_window: cfg.sliding_window,
-            device: vb.device().clone(),
-            dtype: vb.dtype(),
+            device: vb_m.device().clone(),
+            dtype: vb_m.dtype(),
         })
+    }
+
+    fn lm_head(&self) -> Result<&Linear> {
+        match &self.lm_head {
+            Some(h) => Ok(h),
+            None => candle::bail!("this model was loaded without its language-model head"),
+        }
+    }
+
+    /// Runs the model as an encoder over a right-padded batch and returns the hidden states
+    /// after each of the first `layers[i]` decoder layers, before the final norm. This matches
+    /// `hidden_states[layers[i]]` in transformers.
+    ///
+    /// `attention_mask` is `(B, L)`, non-zero for real tokens: padded keys are masked out, on top
+    /// of the causal (and sliding-window) mask. The KV cache is neither read nor written.
+    pub fn forward_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        attention_mask: Option<&Tensor>,
+        layers: &[usize],
+    ) -> Result<Vec<Tensor>> {
+        let (b, l) = input_ids.dims2()?;
+        let mask = self
+            .prepare_decoder_attention_mask(l, 0)?
+            .to_dtype(DType::F32)?;
+        let mask = match attention_mask {
+            Some(am) => {
+                let neg_inf = Tensor::full(f32::NEG_INFINITY, (b, l), &self.device)?;
+                let pad = am
+                    .eq(0u32)?
+                    .where_cond(&neg_inf, &neg_inf.zeros_like()?)?
+                    .reshape((b, 1, 1, l))?;
+                mask.broadcast_add(&pad)?
+            }
+            None => mask,
+        };
+        let mask = mask.to_dtype(self.dtype)?;
+        let last = layers.iter().copied().max().unwrap_or(0);
+        if last > self.layers.len() {
+            candle::bail!(
+                "layer {last} requested from a {}-layer model",
+                self.layers.len()
+            )
+        }
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let mut outs = vec![None; layers.len()];
+        for idx in 0..=last {
+            for (o, &want) in outs.iter_mut().zip(layers.iter()) {
+                if want == idx {
+                    *o = Some(xs.clone())
+                }
+            }
+            if idx < last {
+                // A fresh copy of the layer, so that its KV cache stays untouched.
+                let mut layer = self.layers[idx].clone();
+                layer.clear_kv_cache();
+                xs = layer.forward(&xs, Some(&mask), 0)?;
+            }
+        }
+        Ok(outs.into_iter().map(|o| o.unwrap()).collect())
     }
 
     fn prepare_decoder_attention_mask(
@@ -440,7 +516,7 @@ impl Model {
         }
         xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
-            .apply(&self.lm_head)
+            .apply(self.lm_head()?)
     }
 
     pub fn forward_embeds(
@@ -456,7 +532,7 @@ impl Model {
         }
         xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
-            .apply(&self.lm_head)
+            .apply(self.lm_head()?)
     }
 
     pub fn clear_kv_cache(&mut self) {

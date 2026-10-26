@@ -42,6 +42,7 @@ pub mod eva2;
 pub mod falcon;
 pub mod fastvit;
 pub mod flux;
+pub mod flux2;
 pub mod gemma;
 pub mod gemma2;
 pub mod gemma3;

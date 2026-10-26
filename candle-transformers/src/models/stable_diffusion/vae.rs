@@ -298,6 +298,11 @@ pub struct DiagonalGaussianDistribution {
 }
 
 impl DiagonalGaussianDistribution {
+    /// The mean, the most likely latent.
+    pub fn mode(&self) -> &Tensor {
+        &self.mean
+    }
+
     pub fn new(parameters: &Tensor) -> Result<Self> {
         let mut parameters = parameters.chunk(2, 1)?.into_iter();
         let mean = parameters.next().unwrap();
