@@ -365,6 +365,9 @@ mod tests {
         // Above 4300 tokens the shift only depends on the token count.
         assert_eq!(empirical_mu(5000, 4), empirical_mu(5000, 50));
         assert!((empirical_mu(5000, 4) - (0.00016927 * 5000. + 0.45666666)).abs() < 1e-12);
+        // 4300 tokens is still on the interpolated side.
+        let at_bound = empirical_mu(4300, 10);
+        assert!((at_bound - (8.73809524e-05 * 4300. + 1.89833333)).abs() < 1e-9);
         // Below, it interpolates between the fits at 10 and 200 steps.
         let fit_10 = 8.73809524e-05 * 1024. + 1.89833333;
         let fit_200 = 0.00016927 * 1024. + 0.45666666;
@@ -545,7 +548,8 @@ mod tests {
     fn vae_config() {
         let cfg: VaeConfig = serde_json::from_str("{}").unwrap();
         let d = VaeConfig::default();
-        assert_eq!(cfg.block_out_channels, d.block_out_channels);
+        assert_eq!(cfg.block_out_channels, [128, 256, 512, 512]);
+        assert_eq!(d.block_out_channels, [128, 256, 512, 512]);
         assert_eq!(
             (
                 cfg.layers_per_block,
