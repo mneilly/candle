@@ -59,7 +59,9 @@ fn check_variant(variant: &str) {
         1e-4,
         "decode",
     );
-    for (i, l) in model.decode_levels(&codes_ref).unwrap().iter().enumerate() {
+    let level_logits = model.decode_levels(&codes_ref).unwrap();
+    assert_eq!(level_logits.len(), levels.len());
+    for (i, l) in level_logits.iter().enumerate() {
         assert_close(l, &r[&format!("level_logits.{i}")], 1e-4, "decode_levels");
     }
 }
