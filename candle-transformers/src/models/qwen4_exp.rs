@@ -1474,7 +1474,7 @@ mod proofs {
 
     /// Every row a token gathers lies in the range of its head.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(10)]
     fn ngram_rows_stay_in_their_head() {
         let hash = tiny_hash();
         let context: [u32; 2] = [kani::any(), kani::any()];
@@ -1493,7 +1493,7 @@ mod proofs {
 
     /// After an end-of-text token, the rows only depend on the tokens that follow it.
     #[kani::proof]
-    #[kani::unwind(6)]
+    #[kani::unwind(10)]
     fn ngram_window_resets_after_eos() {
         let hash = tiny_hash();
         let eos = 3;
@@ -1502,8 +1502,12 @@ mod proofs {
         kani::assume([a, b, x, y].iter().all(|&t| t < 50));
         let rows_1 = hash.rows(&[a, b], &[eos, x, y], 2, eos);
         let rows_2 = hash.rows(&[b, a], &[eos, x, y], 2, eos);
-        // Positions 1 and 2 follow the EOS at position 0.
-        assert_eq!(rows_1[4..], rows_2[4..]);
+        // Positions 1 and 2 follow the EOS at position 0. Compared row by row, since a slice
+        // comparison is a memcmp that needs a bound per byte.
+        assert_eq!(rows_1.len(), 12);
+        for k in 4..12 {
+            assert_eq!(rows_1[k], rows_2[k]);
+        }
     }
 
     /// `is_prime` agrees with trial division by every smaller number.
