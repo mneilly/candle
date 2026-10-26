@@ -10,6 +10,7 @@ use clap::Parser;
 use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
 use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
 use candle_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
+use candle_transformers::models::qwen3_5::{Config as Config35, Model as Model35};
 use candle_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
 
 use candle::{DType, Device, Tensor};
@@ -24,6 +25,7 @@ enum Model {
     Moe(ModelMoe),
     Base3(Model3),
     Moe3(ModelMoe3),
+    Base35(Model35),
 }
 
 impl Model {
@@ -33,6 +35,7 @@ impl Model {
             Self::Base(ref mut m) => m.forward(xs, s),
             Self::Base3(ref mut m) => m.forward(xs, s),
             Self::Moe3(ref mut m) => m.forward(xs, s),
+            Self::Base35(ref mut m) => m.forward(xs, s),
         }
     }
 }
@@ -172,6 +175,10 @@ enum WhichModel {
     W3_8b,
     #[value(name = "3-moe-a3b")]
     W3MoeA3b,
+    #[value(name = "3.5-27b")]
+    W35_27b,
+    #[value(name = "3.8-27b")]
+    W38_27b,
 }
 
 #[derive(Parser, Debug)]
@@ -245,13 +252,30 @@ impl Args {
                 | WhichModel::W3_4b
                 | WhichModel::W3_8b
                 | WhichModel::W3MoeA3b
+                | WhichModel::W35_27b
+                | WhichModel::W38_27b
         ) && !self.no_chat_template
     }
 }
 
-fn format_prompt(prompt: &str, use_chat_template: bool, thinking: bool) -> String {
+fn format_prompt(
+    prompt: &str,
+    use_chat_template: bool,
+    thinking: bool,
+    model: WhichModel,
+) -> String {
     if !use_chat_template {
         return prompt.to_string();
+    }
+    if matches!(model, WhichModel::W35_27b | WhichModel::W38_27b) {
+        // Qwen3.5 and later have no /think switch: thinking is skipped by opening the assistant
+        // turn with an empty think block.
+        let think = if thinking {
+            ""
+        } else {
+            "<think>\n\n</think>\n\n"
+        };
+        return format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{think}");
     }
     let think_tag = if thinking { " /think" } else { " /no_think" };
     format!("<|im_start|>user\n{prompt}{think_tag}<|im_end|>\n<|im_start|>assistant\n")
@@ -307,6 +331,8 @@ fn main() -> Result<()> {
                 WhichModel::W3_4b => ("3", "4B"),
                 WhichModel::W3_8b => ("3", "8B"),
                 WhichModel::W3MoeA3b => ("3", "30B-A3B"),
+                WhichModel::W35_27b => ("3.5", "27B"),
+                WhichModel::W38_27b => ("3.8", "27B"),
             };
             format!("Qwen/Qwen{version}-{size}")
         }
@@ -353,7 +379,9 @@ fn main() -> Result<()> {
             | WhichModel::W3_1_7b
             | WhichModel::W3_4b
             | WhichModel::W3_8b
-            | WhichModel::W3MoeA3b => {
+            | WhichModel::W3MoeA3b
+            | WhichModel::W35_27b
+            | WhichModel::W38_27b => {
                 candle_examples::hub_load_safetensors(&repo, "model.safetensors.index.json")?
             }
         },
@@ -382,6 +410,10 @@ fn main() -> Result<()> {
             let config: ConfigMoe3 = serde_json::from_slice(&std::fs::read(config_file)?)?;
             Model::Moe3(ModelMoe3::new(&config, vb)?)
         }
+        WhichModel::W35_27b | WhichModel::W38_27b => {
+            let config = Config35::from_json(&std::fs::read_to_string(config_file)?)?;
+            Model::Base35(Model35::new(&config, vb)?)
+        }
         _ => {
             let config: ConfigBase = serde_json::from_slice(&std::fs::read(config_file)?)?;
             Model::Base(ModelBase::new(&config, vb)?)
@@ -400,7 +432,7 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    let prompt = format_prompt(&args.prompt, use_chat_template, thinking);
+    let prompt = format_prompt(&args.prompt, use_chat_template, thinking, args.model);
     pipeline.run(&prompt, args.sample_len)?;
     Ok(())
 }

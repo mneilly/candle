@@ -55,3 +55,17 @@ $ cargo run --example qwen --features metal --release  -- --prompt "Write a poem
 # Local unquantized 32B MoE model (with Fused MoE kernel) (~80GB GPU memory)
 cargo run --example qwen --features cuda --release  -- --prompt "Write a poem about butterflies. <think></think>." --model "3-moe-a3b" --weight-path /path/Qwen3-30B-A3B-Instruct-2507
 ```
+## Qwen3.5 and Qwen3.8
+
+The dense Qwen3.5 and Qwen3.8 checkpoints use a hybrid architecture: three layers out of four
+use Gated DeltaNet, a linear-attention recurrence with a fixed-size state, and the others use
+gated full attention. Only the text model is supported; the vision tower and the
+multi-token-prediction weights of these checkpoints are not loaded.
+
+```bash
+$ cargo run --example qwen --features cuda --release -- --model 3.8-27b --prompt "Explain the delta rule."
+```
+
+The 27B models need about 54GB of GPU memory in bf16. As for Qwen3, the prompt is wrapped in the
+chat template unless `--no-chat-template` is passed, and `--thinking` lets the model reason before
+answering.
