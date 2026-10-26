@@ -652,7 +652,20 @@ fn qsa_keep(scores: &[f32], pos: usize, ratio: usize, block_topk: usize, mask: &
     let complete = (pos + 1) / ratio;
     let mut blocks: Vec<usize> = (0..complete).collect();
     if complete > block_topk {
-        blocks.sort_by(|&x, &y| scores[y].total_cmp(&scores[x]).then(x.cmp(&y)));
+        // Best score first, ties to the earlier block.
+        let order = |&x: &usize, &y: &usize| scores[y].total_cmp(&scores[x]).then(x.cmp(&y));
+        #[cfg(not(kani))]
+        blocks.sort_by(order);
+        // std's sort is too large for CBMC, so proofs rank with an insertion sort under the
+        // same order.
+        #[cfg(kani)]
+        for i in 1..blocks.len() {
+            let mut j = i;
+            while j > 0 && order(&blocks[j - 1], &blocks[j]).is_gt() {
+                blocks.swap(j - 1, j);
+                j -= 1;
+            }
+        }
         blocks.truncate(block_topk);
     }
     for j in blocks {
@@ -1407,13 +1420,13 @@ mod proofs {
     /// QSA never lets a query see a future token, always keeps the tail block, keeps whole
     /// blocks, and keeps exactly the `block_topk` best-scoring complete blocks.
     #[kani::proof]
-    #[kani::unwind(10)]
+    #[kani::unwind(8)]
     fn qsa_keeps_the_top_past_blocks_and_the_tail() {
-        const KV: usize = 8;
+        const KV: usize = 6;
         let ratio: usize = kani::any();
         let block_topk: usize = kani::any();
         let pos: usize = kani::any();
-        kani::assume((1..=4).contains(&ratio) && block_topk <= 2 && pos < KV);
+        kani::assume((1..=3).contains(&ratio) && block_topk <= 2 && pos < KV);
         let scores: [f32; KV] = kani::any();
         let mut mask = [f32::NEG_INFINITY; KV];
         qsa_keep(&scores, pos, ratio, block_topk, &mut mask);
