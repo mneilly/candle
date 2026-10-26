@@ -1238,6 +1238,7 @@ mod tests {
     fn linspace_matches_numpy() {
         assert_eq!(linspace(0.5, 0.5, 1), [0.5]);
         assert_eq!(linspace(0., 1., 3), [0., 0.5, 1.]);
+        assert_eq!(linspace(1., 2., 3), [1., 1.5, 2.]);
     }
 
     #[test]
