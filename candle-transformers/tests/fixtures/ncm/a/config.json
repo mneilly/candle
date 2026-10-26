@@ -1,0 +1,70 @@
+{
+  "model": {
+    "attn_pattern": "block_diagonal",
+    "bias": true,
+    "dropout": 0.0,
+    "n_embd": 64,
+    "n_head": 4,
+    "n_layer": 2,
+    "predict_level0": false,
+    "prefix_len": 2,
+    "prefix_pad_token_id": 1,
+    "query_level0": false,
+    "raw_token_prefix": true,
+    "rope_base": 100000,
+    "tie_heads_learn_scale": true,
+    "tie_heads_to_codebook": true,
+    "use_level_encoding": true,
+    "use_qk_norm": true,
+    "use_rope": true,
+    "vocab_size": [
+      32,
+      32,
+      32,
+      32
+    ]
+  },
+  "vqvae": {
+    "compression_factor": 1,
+    "context_length": 16,
+    "dropout": 0.0,
+    "embed_dim": 32,
+    "in_vocab_size": 50,
+    "n_layers": 4,
+    "pre_quant_groupnorm": 8,
+    "use_qk_norm": true,
+    "vector_quantizer_config": {
+      "clss": "multiscale_residual_vector_quantizer",
+      "decay": 0.95,
+      "learned_l1_cascade": true,
+      "learned_l1_cascade_base": 4,
+      "learned_l1_sampling": true,
+      "levels": {
+        "manual_levels": [
+          1,
+          4,
+          8,
+          12,
+          16
+        ],
+        "use_manual_levels": true
+      },
+      "quant_resi": {
+        "enabled": true,
+        "learnable_ratio": false,
+        "ratio": 0.5,
+        "share_mode": 0
+      }
+    },
+    "vqvae_vocab_size": [
+      32,
+      32,
+      32,
+      32,
+      32
+    ]
+  },
+  "eos_token_id": 0,
+  "pad_token_id": 1,
+  "generation": {}
+}

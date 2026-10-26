@@ -529,3 +529,94 @@ pub fn image_ids(height: usize, width: usize, t: u32, device: &Device) -> Result
         .collect();
     Tensor::from_vec(ids, (height * width, 4), device)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"num_layers": 1, "num_single_layers": 1, "attention_head_dim": 128,
+                "num_attention_heads": 2, "joint_attention_dim": 8}"#,
+        )
+        .unwrap();
+        assert_eq!((cfg.patch_size, cfg.in_channels), (1, 128));
+        assert_eq!(cfg.timestep_guidance_channels, 256);
+        assert_eq!(cfg.mlp_ratio, 3.);
+        assert_eq!(cfg.axes_dims_rope, [32, 32, 32, 32]);
+        assert_eq!((cfg.rope_theta, cfg.eps), (2000., 1e-6));
+        assert!(cfg.guidance_embeds);
+        assert_eq!(cfg.out_channels(), 128);
+        assert_eq!(cfg.inner_dim(), 256);
+    }
+
+    #[test]
+    fn rejects_invalid_configs() {
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"num_layers": 0, "num_single_layers": 0, "attention_head_dim": 16,
+                "num_attention_heads": 1, "joint_attention_dim": 8, "in_channels": 4,
+                "timestep_guidance_channels": 8, "axes_dims_rope": [4, 4, 4, 4]}"#,
+        )
+        .unwrap();
+        let vb = VarBuilder::zeros(DType::F32, &Device::Cpu);
+        assert!(Flux2::new(&cfg, vb.clone()).is_ok());
+        cfg.patch_size = 2;
+        assert!(Flux2::new(&cfg, vb.clone()).is_err());
+        cfg.patch_size = 1;
+        cfg.axes_dims_rope = vec![4, 4];
+        assert!(Flux2::new(&cfg, vb).is_err());
+    }
+
+    #[test]
+    fn position_ids() -> Result<()> {
+        let dev = Device::Cpu;
+        assert_eq!(
+            text_ids(3, &dev)?.to_vec2::<u32>()?,
+            [[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 0, 2]]
+        );
+        assert_eq!(
+            image_ids(2, 3, 7, &dev)?.to_vec2::<u32>()?,
+            [
+                [7, 0, 0, 0],
+                [7, 0, 1, 0],
+                [7, 0, 2, 0],
+                [7, 1, 0, 0],
+                [7, 1, 1, 0],
+                [7, 1, 2, 0]
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rope_tables_per_axis() -> Result<()> {
+        // Axis i of the ids rotates the i-th block of frequencies.
+        let dev = Device::Cpu;
+        let ids = Tensor::new(&[[0u32, 2, 0, 0], [0, 0, 0, 3]], &dev)?;
+        let (cos, sin) = rope_tables(&ids, &[2, 4, 2, 2], 100.)?;
+        assert_eq!(cos.dims(), &[2, 5]);
+        let sin = sin.to_vec2::<f32>()?;
+        let cos = cos.to_vec2::<f32>()?;
+        // Row 0: position 2 on axis 1, whose frequencies are 1 and 100^-0.5.
+        assert!((sin[0][1] - 2f32.sin()).abs() < 1e-6);
+        assert!((sin[0][2] - 0.2f32.sin()).abs() < 1e-6);
+        assert_eq!((sin[0][0], sin[0][3], sin[0][4]), (0., 0., 0.));
+        // Row 1: position 3 on the last axis.
+        assert!((cos[1][4] - 3f32.cos()).abs() < 1e-6);
+        assert_eq!(cos[1][..4], [1., 1., 1., 1.]);
+        Ok(())
+    }
+
+    #[test]
+    fn timestep_features_are_cos_then_sin() -> Result<()> {
+        let t = Tensor::new(&[0f32, 1.], &Device::Cpu)?;
+        let f = timestep_features(&t, 4)?.to_vec2::<f32>()?;
+        assert_eq!(f[0], [1., 1., 0., 0.]);
+        // Frequencies 1 and 10000^-0.5.
+        assert!((f[1][0] - 1f32.cos()).abs() < 1e-6);
+        assert!((f[1][1] - 0.01f32.cos()).abs() < 1e-6);
+        assert!((f[1][3] - 0.01f32.sin()).abs() < 1e-6);
+        Ok(())
+    }
+}

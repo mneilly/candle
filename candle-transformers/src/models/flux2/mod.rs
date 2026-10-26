@@ -350,3 +350,229 @@ pub fn to_u8_image(images: &Tensor) -> Result<Tensor> {
         .round()?
         .to_dtype(DType::U8)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::Device;
+
+    #[test]
+    fn empirical_mu_branches() {
+        // Above 4300 tokens the shift only depends on the token count.
+        assert_eq!(empirical_mu(5000, 4), empirical_mu(5000, 50));
+        assert!((empirical_mu(5000, 4) - (0.00016927 * 5000. + 0.45666666)).abs() < 1e-12);
+        // Below, it interpolates between the fits at 10 and 200 steps.
+        let fit_10 = 8.73809524e-05 * 1024. + 1.89833333;
+        let fit_200 = 0.00016927 * 1024. + 0.45666666;
+        assert!((empirical_mu(1024, 10) - fit_10).abs() < 1e-9);
+        assert!((empirical_mu(1024, 200) - fit_200).abs() < 1e-9);
+    }
+
+    fn sigmas(cfg: &SchedulerConfig, steps: usize) -> Vec<f64> {
+        Scheduler::new(cfg, steps, 1024).unwrap().sigmas
+    }
+
+    #[test]
+    fn scheduler_variants() {
+        let cfg = SchedulerConfig::default();
+        let s = sigmas(&cfg, 4);
+        assert_eq!(s.len(), 5);
+        assert_eq!((s[0], s[4]), (1., 0.));
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
+        assert_eq!(sigmas(&cfg, 1), [1., 0.]);
+
+        // The linear time shift: mu / (mu + 1/t - 1).
+        let linear = SchedulerConfig {
+            time_shift_type: "linear".into(),
+            ..Default::default()
+        };
+        let mu = empirical_mu(1024, 2);
+        let expected = mu / (mu + (1. / 0.5 - 1.));
+        assert!((sigmas(&linear, 2)[1] - expected).abs() < 1e-6);
+
+        // A fixed shift: shift * t / (1 + (shift - 1) t).
+        let fixed = SchedulerConfig {
+            use_dynamic_shifting: false,
+            shift: 3.,
+            ..Default::default()
+        };
+        assert!((sigmas(&fixed, 2)[1] - 3. * 0.5 / (1. + 2. * 0.5)).abs() < 1e-6);
+        let identity = SchedulerConfig {
+            use_dynamic_shifting: false,
+            ..Default::default()
+        };
+        assert_eq!(sigmas(&identity, 2), [1., 0.5, 0.]);
+
+        // shift_terminal stretches the schedule so that it ends at the terminal value.
+        let terminal = SchedulerConfig {
+            use_dynamic_shifting: false,
+            shift_terminal: Some(0.1),
+            ..Default::default()
+        };
+        let s = sigmas(&terminal, 3);
+        assert!((s[2] - 0.1).abs() < 1e-6, "{s:?}");
+        assert_eq!(s[0], 1.);
+    }
+
+    #[test]
+    fn scheduler_rejects_unsupported_configs() {
+        let cases = [
+            SchedulerConfig {
+                invert_sigmas: true,
+                ..Default::default()
+            },
+            SchedulerConfig {
+                stochastic_sampling: true,
+                ..Default::default()
+            },
+            SchedulerConfig {
+                use_karras_sigmas: true,
+                ..Default::default()
+            },
+            SchedulerConfig {
+                use_exponential_sigmas: true,
+                ..Default::default()
+            },
+            SchedulerConfig {
+                use_beta_sigmas: true,
+                ..Default::default()
+            },
+            SchedulerConfig {
+                time_shift_type: "cosine".into(),
+                ..Default::default()
+            },
+        ];
+        for cfg in cases {
+            assert!(Scheduler::new(&cfg, 4, 16).is_err(), "{cfg:?}");
+        }
+        assert!(Scheduler::new(&SchedulerConfig::default(), 0, 16).is_err());
+    }
+
+    #[test]
+    fn scheduler_config_defaults() {
+        let cfg: SchedulerConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.num_train_timesteps, 1000);
+        assert_eq!(cfg.shift, 1.);
+        assert_eq!(cfg.time_shift_type, "exponential");
+        assert!(
+            !cfg.use_dynamic_shifting,
+            "diffusers defaults to no dynamic shifting"
+        );
+        assert!(SchedulerConfig::default().use_dynamic_shifting);
+    }
+
+    #[test]
+    fn euler_step() -> Result<()> {
+        let s = Scheduler {
+            sigmas: vec![1., 0.75, 0.],
+        };
+        assert_eq!(s.len(), 2);
+        assert!(!s.is_empty());
+        let dev = Device::Cpu;
+        let x = Tensor::new(&[1f32, 2.], &dev)?;
+        let v = Tensor::new(&[4f32, -4.], &dev)?;
+        assert_eq!(s.step(&x, &v, 0)?.to_vec1::<f32>()?, [0., 3.]);
+        assert_eq!(s.step(&x, &v, 1)?.to_vec1::<f32>()?, [-2., 5.]);
+        // The step keeps the latents' dtype.
+        let x16 = x.to_dtype(DType::BF16)?;
+        assert_eq!(s.step(&x16, &v, 0)?.dtype(), DType::BF16);
+        assert!(Scheduler { sigmas: vec![0.] }.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn packing_round_trips() -> Result<()> {
+        let dev = Device::Cpu;
+        let x = Tensor::arange(0f32, 2. * 4. * 4. * 6., &dev)?.reshape((2, 4, 4, 6))?;
+        let packed = pack(&x)?;
+        assert_eq!(packed.dims(), &[2, 24, 4]);
+        // Token (h, w) holds the channels of that position.
+        assert_eq!(
+            packed.get(0)?.get(7)?.to_vec1::<f32>()?,
+            x.get(0)?
+                .narrow(1, 1, 1)?
+                .narrow(2, 1, 1)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+        );
+        assert_eq!(
+            unpack(&packed, 4, 6)?.flatten_all()?.to_vec1::<f32>()?,
+            x.flatten_all()?.to_vec1::<f32>()?
+        );
+        let p = patchify(&x)?;
+        assert_eq!(p.dims(), &[2, 16, 2, 3]);
+        // Channel c * 4 + 2 * dy + dx of patch (i, j) is pixel (2i + dy, 2j + dx) of channel c.
+        let v = p.to_dtype(DType::F32)?;
+        let px = |b: usize, c: usize, h: usize, w: usize| -> Result<f32> {
+            x.get(b)?.get(c)?.get(h)?.get(w)?.to_scalar::<f32>()
+        };
+        let pv = |b: usize, c: usize, h: usize, w: usize| -> Result<f32> {
+            v.get(b)?.get(c)?.get(h)?.get(w)?.to_scalar::<f32>()
+        };
+        assert_eq!(pv(1, 2 * 4 + 3, 1, 2)?, px(1, 2, 3, 5)?);
+        assert_eq!(pv(0, 1, 0, 1)?, px(0, 0, 0, 3)?);
+        assert_eq!(
+            unpatchify(&p)?.flatten_all()?.to_vec1::<f32>()?,
+            x.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cfg_and_image_conversion() -> Result<()> {
+        let dev = Device::Cpu;
+        let cond = Tensor::new(&[3f32, 1.], &dev)?;
+        let uncond = Tensor::new(&[1f32, 1.], &dev)?;
+        assert_eq!(apply_cfg(&cond, &uncond, 2.)?.to_vec1::<f32>()?, [5., 1.]);
+        let img = Tensor::new(&[-2f32, -1., 0., 1., 3.], &dev)?;
+        assert_eq!(to_u8_image(&img)?.to_vec1::<u8>()?, [0, 0, 128, 255, 255]);
+        let h = [
+            Tensor::new(&[[[1f32, 2.]]], &dev)?,
+            Tensor::new(&[[[3f32, 4.]]], &dev)?,
+        ];
+        assert_eq!(
+            stack_text_embeddings(&h)?.to_vec3::<f32>()?,
+            [[[1., 2., 3., 4.]]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vae_config() {
+        let cfg: VaeConfig = serde_json::from_str("{}").unwrap();
+        let d = VaeConfig::default();
+        assert_eq!(cfg.block_out_channels, d.block_out_channels);
+        assert_eq!(
+            (
+                cfg.layers_per_block,
+                cfg.latent_channels,
+                cfg.norm_num_groups
+            ),
+            (2, 32, 32)
+        );
+        assert!(cfg.use_quant_conv && cfg.use_post_quant_conv && cfg.mid_block_add_attention);
+        assert_eq!(cfg.batch_norm_eps, d.batch_norm_eps);
+        assert!(cfg.decoder_block_out_channels.is_none());
+
+        let vb = VarBuilder::zeros(DType::F32, &Device::Cpu);
+        let separate = VaeConfig {
+            decoder_block_out_channels: Some(vec![1]),
+            ..Default::default()
+        };
+        assert!(Vae::new(&separate, vb.clone()).is_err());
+        let no_attn = VaeConfig {
+            mid_block_add_attention: false,
+            ..Default::default()
+        };
+        assert!(Vae::new(&no_attn, vb.clone()).is_err());
+        // Matching decoder channels are accepted.
+        let same = VaeConfig {
+            block_out_channels: vec![8, 8],
+            decoder_block_out_channels: Some(vec![8, 8]),
+            latent_channels: 4,
+            norm_num_groups: 4,
+            ..Default::default()
+        };
+        assert!(Vae::new(&same, vb).is_ok());
+    }
+}

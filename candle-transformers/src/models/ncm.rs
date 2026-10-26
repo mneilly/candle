@@ -1198,6 +1198,7 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle::D;
 
     #[test]
     fn interp_matrices() {
@@ -1215,5 +1216,281 @@ mod tests {
         assert_eq!(plan_cascade_strides(128, 4), [4, 4, 4, 2]);
         assert_eq!(plan_cascade_strides(8, 4), [4, 2]);
         assert_eq!(plan_cascade_strides(1, 4), [1]);
+        // A factor that does not divide falls back to the next smaller one, and a prime above
+        // the base becomes a single stride.
+        assert_eq!(plan_cascade_strides(9, 4), [3, 3]);
+        assert_eq!(plan_cascade_strides(7, 4), [7]);
+    }
+
+    #[test]
+    fn linspace_matches_numpy() {
+        assert_eq!(linspace(0.5, 0.5, 1), [0.5]);
+        assert_eq!(linspace(0., 1., 3), [0., 0.5, 1.]);
+    }
+
+    #[test]
+    fn tinystories_config() {
+        let cfg = Config::tinystories();
+        cfg.check_supported().unwrap();
+        assert_eq!(
+            cfg.vqvae.vector_quantizer_config.levels.manual_levels.len(),
+            12
+        );
+        assert_eq!(cfg.model.vocab_size.len(), 11);
+    }
+
+    #[test]
+    fn config_defaults() {
+        let model: GeneratorConfig = serde_json::from_str(
+            r#"{"n_layer": 1, "n_head": 2, "n_embd": 8, "bias": true, "prefix_len": 1, "vocab_size": [4]}"#,
+        )
+        .unwrap();
+        assert_eq!(model.rope_base, 10000.);
+        assert_eq!(model.mlp_ratio, 4.);
+        assert!(model.tie_heads_learn_scale && model.untied_head_bias);
+        assert!(
+            !model.use_rope && !model.tie_heads_to_codebook && model.prefix_pad_token_id.is_none()
+        );
+        let vq: VqVaeConfig = serde_json::from_str(
+            r#"{"embed_dim": 4, "in_vocab_size": 9, "context_length": 8, "n_layers": 1,
+                "vqvae_vocab_size": [4, 4],
+                "vector_quantizer_config": {"levels": {}, "quant_resi": {}}}"#,
+        )
+        .unwrap();
+        assert_eq!(vq.compression_factor, 4);
+        assert_eq!(vq.dec_layers, 1);
+        let q = &vq.vector_quantizer_config;
+        assert_eq!(q.learned_l1_cascade_base, 4);
+        assert!(!q.levels.use_manual_levels && q.levels.manual_levels.is_empty());
+        let r = q.quant_resi.as_ref().unwrap();
+        assert!(r.enabled && r.ratio == 0.5 && r.share_mode == 0 && r.arch == "blend");
+        let t: Toggle = serde_json::from_str("{}").unwrap();
+        assert!(!t.enabled);
+    }
+
+    #[test]
+    fn rejects_unsupported_configs() {
+        type Edit = fn(&mut Config);
+        let cases: [(Edit, &str); 17] = [
+            (|c| c.model.predict_level0 = true, "predict_level0"),
+            (|c| c.model.query_level0 = true, "query_level0"),
+            (|c| c.model.shared_output_head = true, "shared_output_head"),
+            (
+                |c| c.model.ctx_encoder = Some(Toggle { enabled: true }),
+                "ctx_encoder",
+            ),
+            (
+                |c| c.model.post_upsample_conv = Some(Toggle { enabled: true }),
+                "post_upsample_conv",
+            ),
+            (|c| c.model.use_geglu = true, "gated or relu2"),
+            (|c| c.model.parallel_block = true, "parallel_block"),
+            (|c| c.model.normformer = true, "normformer"),
+            (|c| c.model.use_rezero = true, "layerscale or rezero"),
+            (|c| c.model.n_kv_heads = Some(4), "grouped-query"),
+            (|c| c.model.raw_token_prefix = false, "encoded"),
+            (
+                |c| {
+                    c.model.contextual_prefix = true;
+                    c.vqvae.enc_layers = 1
+                },
+                "contextual_prefix",
+            ),
+            (
+                |c| c.vqvae.vector_quantizer_config.levels.use_manual_levels = false,
+                "level schedulers",
+            ),
+            (
+                |c| c.vqvae.vector_quantizer_config.learned_all_sampling = true,
+                "learned_all_sampling",
+            ),
+            (
+                |c| c.vqvae.vector_quantizer_config.learned_l1_cascade_norm = true,
+                "cascade_norm",
+            ),
+            (
+                |c| {
+                    c.vqvae
+                        .vector_quantizer_config
+                        .quant_resi
+                        .as_mut()
+                        .unwrap()
+                        .arch = "convstack".into()
+                },
+                "blend",
+            ),
+            (
+                |c| {
+                    c.vqvae.vqvae_vocab_size.pop();
+                },
+                "codebooks",
+            ),
+        ];
+        for (edit, expected) in cases {
+            let mut cfg = Config::tinystories();
+            edit(&mut cfg);
+            let err = cfg.check_supported().unwrap_err().to_string();
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        // Accepted variants: the n_kv_heads default, and a contextual prefix without encoder
+        // layers.
+        let mut cfg = Config::tinystories();
+        cfg.model.n_kv_heads = Some(cfg.model.n_head);
+        cfg.model.contextual_prefix = true;
+        cfg.check_supported().unwrap();
+    }
+
+    /// A tiny config, for models built from random weights.
+    fn tiny() -> Config {
+        let mut cfg = Config::tinystories();
+        let m = &mut cfg.model;
+        m.n_layer = 1;
+        m.n_head = 2;
+        m.n_embd = 16;
+        m.prefix_len = 2;
+        m.vocab_size = vec![8; 3];
+        let vq = &mut cfg.vqvae;
+        vq.embed_dim = 8;
+        vq.in_vocab_size = 20;
+        vq.context_length = 16;
+        vq.n_layers = 2;
+        vq.vqvae_vocab_size = vec![8; 4];
+        vq.vector_quantizer_config.levels.manual_levels = vec![1, 4, 8, 16];
+        cfg
+    }
+
+    /// Builds a model from random weights, giving the scalar parameters fixed values.
+    fn random_model(cfg: &Config) -> Result<Model> {
+        let dev = Device::Cpu;
+        let varmap = candle_nn::VarMap::new();
+        let init = candle_nn::Init::Const(0.25);
+        for i in 0..cfg.model.vocab_size.len() {
+            varmap.get(
+                (),
+                &format!("lm_heads.{i}.log_inv_T"),
+                init,
+                DType::F32,
+                &dev,
+            )?;
+        }
+        for i in 0..cfg.vqvae.vqvae_vocab_size.len() {
+            for name in ["vq.quant_resi", "vq.quant_resi.qresi_ls"] {
+                varmap.get(
+                    (),
+                    &format!("{name}.{i}.ratio_logit"),
+                    init,
+                    DType::F32,
+                    &dev,
+                )?;
+            }
+        }
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
+        Model::new(cfg, vb.clone(), vb)
+    }
+
+    fn run(model: &Model) -> Result<(Tensor, Tensor)> {
+        let dev = Device::Cpu;
+        let prefix = Tensor::new(&[[0u32, 1], [4, 5]], &dev)?;
+        let l0 = Tensor::new(&[[2u32], [6]], &dev)?;
+        let codes = model.generate(&prefix, &l0, |_, l| l.argmax(D::Minus1))?;
+        let logits = model.decode(&codes)?;
+        Ok((codes, logits))
+    }
+
+    fn assert_finite(t: &Tensor) {
+        let v: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(v.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn random_weight_variants_run() -> Result<()> {
+        type Edit = fn(&mut Config);
+        let variants: [Edit; 5] = [
+            // Interpolated level-0 upsampling, no residual, decoder positions, trainable tied
+            // heads with a bias and no learned scale.
+            |c| {
+                c.vqvae.vector_quantizer_config.learned_l1_sampling = false;
+                c.vqvae.vector_quantizer_config.quant_resi = None;
+                c.vqvae.dec_positional = true;
+                c.model.tie_heads_trainable = true;
+                c.model.tie_heads_bias = true;
+                c.model.tie_heads_learn_scale = false;
+            },
+            // Residuals with a zero ratio are identities.
+            |c| {
+                c.vqvae
+                    .vector_quantizer_config
+                    .quant_resi
+                    .as_mut()
+                    .unwrap()
+                    .ratio = 0.
+            },
+            // Four partially shared, learnable residuals.
+            |c| {
+                let r = c.vqvae.vector_quantizer_config.quant_resi.as_mut().unwrap();
+                r.share_mode = 4;
+                r.learnable_ratio = true;
+            },
+            // A single shared residual, and no prefix padding.
+            |c| {
+                c.vqvae
+                    .vector_quantizer_config
+                    .quant_resi
+                    .as_mut()
+                    .unwrap()
+                    .share_mode = 1;
+                c.model.prefix_pad_token_id = None;
+            },
+            // Learned positions and untied heads without bias.
+            |c| {
+                c.model.use_rope = false;
+                c.model.tie_heads_to_codebook = false;
+                c.model.untied_head_bias = false;
+                c.model.use_level_encoding = false;
+            },
+        ];
+        for edit in variants {
+            let mut cfg = tiny();
+            edit(&mut cfg);
+            let model = random_model(&cfg)?;
+            let (codes, logits) = run(&model)?;
+            assert_eq!(codes.dims(), &[2, 29]);
+            assert_eq!(logits.dims(), &[2, 16, 20]);
+            assert_finite(&logits);
+            // Generation is deterministic with a greedy sampler.
+            assert_eq!(codes.to_vec2::<u32>()?, run(&model)?.0.to_vec2::<u32>()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn zero_ratio_residuals_are_identities() -> Result<()> {
+        let mut cfg = tiny();
+        cfg.vqvae
+            .vector_quantizer_config
+            .quant_resi
+            .as_mut()
+            .unwrap()
+            .ratio = 0.;
+        let model = random_model(&cfg)?;
+        assert!(model.quantizer().phi.iter().all(|p| p.is_none()));
+        // Without residual, the last level's contribution is its code embeddings.
+        let ids: Vec<u32> = (0..16).map(|i| i % 8).collect();
+        let codes = Tensor::new(ids, &Device::Cpu)?.unsqueeze(0)?;
+        let q = model.quantizer().level_contribution(3, &codes)?;
+        let e = model
+            .quantizer()
+            .codebook(3)
+            .index_select(&codes.squeeze(0)?, 0)?;
+        assert_eq!(q.squeeze(0)?.to_vec2::<f32>()?, e.to_vec2::<f32>()?);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_indivisible_level0_upsampling() {
+        let mut cfg = tiny();
+        cfg.vqvae.vector_quantizer_config.levels.manual_levels = vec![3, 4, 8, 16];
+        let err = random_model(&cfg).unwrap_err().to_string();
+        assert!(err.contains("divisible"), "{err}");
     }
 }
