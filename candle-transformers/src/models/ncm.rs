@@ -1499,6 +1499,40 @@ mod tests {
     }
 
     #[test]
+    fn scalars_and_tied_head_scale() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut w = std::collections::HashMap::new();
+        w.insert("s".to_string(), Tensor::new(1.5f32, &dev)?);
+        let vb = VarBuilder::from_tensors(w, DType::F32, &dev);
+        assert_eq!(read_scalar(&vb, "s")?, 1.5);
+
+        // The tied head scales by exp(log_inv_T) / mean ||E_i||^2.
+        let mut cfg = tiny();
+        cfg.model.n_embd = 2;
+        let codebook = Tensor::new(&[[1f32, 0.], [0., 2.]], &dev)?;
+        let mut w = std::collections::HashMap::new();
+        w.insert("log_inv_T".to_string(), Tensor::new(0.5f32, &dev)?);
+        w.insert(
+            "proj.weight".to_string(),
+            Tensor::new(&[[1f32, 0.], [0., 1.]], &dev)?,
+        );
+        let vb = VarBuilder::from_tensors(w, DType::F32, &dev);
+        let head = Head::tied(&cfg.model, &codebook, vb)?;
+        let Head::Tied { scale, .. } = &head else {
+            panic!("expected a tied head")
+        };
+        assert!((scale - 0.5f64.exp() / 2.5).abs() < 1e-9);
+        // logits = (2 z.E_i - ||E_i||^2) * scale.
+        let z = Tensor::new(&[[[1f32, 1.]]], &dev)?;
+        let logits = head.forward(&z)?.flatten_all()?.to_vec1::<f32>()?;
+        let expected = [(2. - 1.) * scale, (4. - 4.) * scale];
+        for (l, e) in logits.iter().zip(expected) {
+            assert!((*l as f64 - e).abs() < 1e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rejects_indivisible_level0_upsampling() {
         let mut cfg = tiny();
         cfg.vqvae.vector_quantizer_config.levels.manual_levels = vec![3, 4, 8, 16];
