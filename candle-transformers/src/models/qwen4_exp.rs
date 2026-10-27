@@ -656,16 +656,9 @@ fn qsa_keep(scores: &[f32], pos: usize, ratio: usize, block_topk: usize, mask: &
         let order = |&x: &usize, &y: &usize| scores[y].total_cmp(&scores[x]).then(x.cmp(&y));
         #[cfg(not(kani))]
         blocks.sort_by(order);
-        // std's sort is too large for CBMC, so proofs rank with an insertion sort under the
-        // same order.
+        // std's sort is too large for CBMC.
         #[cfg(kani)]
-        for i in 1..blocks.len() {
-            let mut j = i;
-            while j > 0 && order(&blocks[j - 1], &blocks[j]).is_gt() {
-                blocks.swap(j - 1, j);
-                j -= 1;
-            }
-        }
+        proofs::insertion_sort_by(&mut blocks, order);
         blocks.truncate(block_topk);
     }
     for j in blocks {
@@ -1416,6 +1409,17 @@ mod tests {
 #[cfg(kani)]
 mod proofs {
     use super::*;
+
+    /// Sorts like `sort_by` under `order`, small enough for CBMC.
+    pub(super) fn insertion_sort_by<T>(xs: &mut [T], order: impl Fn(&T, &T) -> std::cmp::Ordering) {
+        for i in 1..xs.len() {
+            let mut j = i;
+            while j > 0 && order(&xs[j - 1], &xs[j]).is_gt() {
+                xs.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
 
     /// QSA never lets a query see a future token, always keeps the tail block, keeps whole
     /// blocks, and keeps exactly the `block_topk` best-scoring complete blocks, for every
