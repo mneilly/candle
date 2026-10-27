@@ -67,6 +67,18 @@ fn matches_reference_with_table_loaded() {
         1e-4,
         "forward",
     );
+
+    // Clearing drops every cache, the QSA keys included: on a different sequence the cleared
+    // model matches a fresh one.
+    model.clear_kv_cache();
+    let cont = r["cont"].to_dtype(DType::U32).unwrap();
+    let mut fresh = Model::new(&config(), vb(&["qwen4_exp/model.safetensors"]).unwrap()).unwrap();
+    assert_close(
+        &model.forward_all(&cont, 0).unwrap(),
+        &fresh.forward_all(&cont, 0).unwrap(),
+        0.,
+        "cleared",
+    );
 }
 
 #[test]
