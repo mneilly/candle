@@ -1418,25 +1418,26 @@ mod proofs {
     use super::*;
 
     /// QSA never lets a query see a future token, always keeps the tail block, keeps whole
-    /// blocks, and keeps exactly the `block_topk` best-scoring complete blocks.
-    #[kani::proof]
-    #[kani::unwind(8)]
-    fn qsa_keeps_the_top_past_blocks_and_the_tail() {
+    /// blocks, and keeps exactly the `block_topk` best-scoring complete blocks, for every
+    /// position and budget over any scores. Positions and budgets are enumerated so that every
+    /// slice has a concrete length; symbolic ones run CBMC out of memory.
+    fn check_qsa(ratio: usize) {
         const KV: usize = 6;
-        let ratio: usize = kani::any();
-        let block_topk: usize = kani::any();
-        let pos: usize = kani::any();
-        kani::assume((1..=3).contains(&ratio) && block_topk <= 2 && pos < KV);
         let scores: [f32; KV] = kani::any();
-        let mut mask = [f32::NEG_INFINITY; KV];
-        qsa_keep(&scores, pos, ratio, block_topk, &mut mask);
+        for pos in 0..KV {
+            for block_topk in 0..=2 {
+                let mut mask = [f32::NEG_INFINITY; KV];
+                qsa_keep(&scores, pos, ratio, block_topk, &mut mask);
+                check_qsa_mask(&scores, &mask, pos, ratio, block_topk);
+            }
+        }
+    }
 
+    fn check_qsa_mask(scores: &[f32], mask: &[f32], pos: usize, ratio: usize, block_topk: usize) {
         let kept = |j: usize| mask[j] == 0.;
         let complete = (pos + 1) / ratio;
-        for j in 0..KV {
-            if kept(j) {
-                assert!(j <= pos, "a future token is visible");
-            }
+        for (j, _) in mask.iter().enumerate().skip(pos + 1) {
+            assert!(!kept(j), "a future token is visible");
         }
         for j in complete * ratio..=pos {
             assert!(kept(j), "the tail block is dropped");
@@ -1459,6 +1460,24 @@ mod proofs {
             }
         }
         assert_eq!(n_kept, complete.min(block_topk));
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn qsa_keeps_the_top_blocks_ratio_1() {
+        check_qsa(1)
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn qsa_keeps_the_top_blocks_ratio_2() {
+        check_qsa(2)
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn qsa_keeps_the_top_blocks_ratio_3() {
+        check_qsa(3)
     }
 
     fn tiny_hash() -> NgramHash {
