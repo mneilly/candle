@@ -154,7 +154,7 @@ def qwen3_5_fixtures(out):
         torch.manual_seed(0)
         cfg = Qwen3_5TextConfig(
             vocab_size=50, hidden_size=32, intermediate_size=48, num_hidden_layers=4,
-            num_attention_heads=2, num_key_value_heads=1, head_dim=16, max_position_embeddings=256,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=16, max_position_embeddings=256,
             linear_conv_kernel_dim=4, linear_key_head_dim=8, linear_value_head_dim=8,
             linear_num_key_heads=2, linear_num_value_heads=4, tie_word_embeddings=multimodal,
             rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5},
@@ -184,7 +184,7 @@ def qwen4_exp_fixtures(out):
 
     torch.manual_seed(0)
     cfg = Qwen4ExpTextConfig(
-        vocab_size=50, hidden_size=32, num_hidden_layers=4, num_attention_heads=2, num_key_value_heads=1,
+        vocab_size=50, hidden_size=32, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
         head_dim=16, max_position_embeddings=256, rms_norm_eps=1e-6,
         linear_conv_kernel_dim=4, linear_key_head_dim=8, linear_value_head_dim=8,
         linear_num_key_heads=2, linear_num_value_heads=4,
