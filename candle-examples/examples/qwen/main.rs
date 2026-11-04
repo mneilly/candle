@@ -11,6 +11,7 @@ use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM 
 use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
 use candle_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
 use candle_transformers::models::qwen3_5::{Config as Config35, Model as Model35};
+use candle_transformers::models::qwen3_5_vl;
 use candle_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
 use candle_transformers::models::qwen4_exp::{Config as Config4Exp, Model as Model4Exp, PleTable};
 
@@ -27,6 +28,7 @@ enum Model {
     Base3(Model3),
     Moe3(ModelMoe3),
     Base35(Model35),
+    Vl35(Box<qwen3_5_vl::Model>),
     Qwen4Exp(Model4Exp),
 }
 
@@ -38,6 +40,7 @@ impl Model {
             Self::Base3(ref mut m) => m.forward(xs, s),
             Self::Moe3(ref mut m) => m.forward(xs, s),
             Self::Base35(ref mut m) => m.forward(xs, s),
+            Self::Vl35(ref mut m) => m.forward(xs, s),
             Self::Qwen4Exp(ref mut m) => m.forward(xs, s),
         }
     }
@@ -50,6 +53,8 @@ struct TextGeneration {
     logits_processor: LogitsProcessor,
     repeat_penalty: f32,
     repeat_last_n: usize,
+    /// The pixel values and grids of the images of the prompt.
+    images: Option<(Tensor, Vec<qwen3_5_vl::Grid>)>,
 }
 
 impl TextGeneration {
@@ -72,6 +77,7 @@ impl TextGeneration {
             repeat_penalty,
             repeat_last_n,
             device: device.clone(),
+            images: None,
         }
     }
 
@@ -107,7 +113,17 @@ impl TextGeneration {
             let start_pos = tokens.len().saturating_sub(context_size);
             let ctxt = &tokens[start_pos..];
             let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-            let logits = self.model.forward(&input, start_pos)?;
+            let logits = match (&mut self.model, &self.images, index) {
+                (Model::Vl35(m), Some((pixel_values, grids)), 0) => {
+                    let images = qwen3_5_vl::Images {
+                        pixel_values,
+                        grids,
+                    };
+                    let logits = m.forward_prompt(&input, Some(images))?;
+                    logits.narrow(1, ctxt.len() - 1, 1)?
+                }
+                _ => self.model.forward(&input, start_pos)?,
+            };
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
             let logits = if self.repeat_penalty == 1. {
                 logits
@@ -299,6 +315,15 @@ struct Args {
     #[arg(long)]
     no_chat_template: bool,
 
+    /// Images for Qwen3.5 and Qwen3.8, which loads the vision tower; without it the tower's
+    /// weights are never read.
+    #[arg(long)]
+    image: Vec<String>,
+
+    /// The largest number of pixels an image is resized to.
+    #[arg(long, default_value_t = 28 * 28 * 1280)]
+    max_image_pixels: usize,
+
     /// Speculative decoding for Qwen3.5 and Qwen3.8: the checkpoint's MTP head drafts this many
     /// tokens per step. Decoding is then greedy, without repeat penalty.
     #[arg(long)]
@@ -482,6 +507,10 @@ fn main() -> Result<()> {
             let config: ConfigMoe3 = serde_json::from_slice(&std::fs::read(config_file)?)?;
             Model::Moe3(ModelMoe3::new(&config, vb)?)
         }
+        WhichModel::W35_27b | WhichModel::W38_27b if !args.image.is_empty() => {
+            let config = qwen3_5_vl::Config::from_json(&std::fs::read_to_string(config_file)?)?;
+            Model::Vl35(Box::new(qwen3_5_vl::Model::new(&config, vb, true)?))
+        }
         WhichModel::W35_27b | WhichModel::W38_27b => {
             let config = Config35::from_json(&std::fs::read_to_string(config_file)?)?;
             Model::Base35(Model35::new(&config, vb)?)
@@ -519,7 +548,42 @@ fn main() -> Result<()> {
         args.repeat_last_n,
         &device,
     );
-    let prompt = format_prompt(&args.prompt, use_chat_template, thinking, args.model);
+    let mut user = args.prompt.clone();
+    if let Model::Vl35(m) = &pipeline.model {
+        // Each image becomes a run of placeholder tokens, one per merged patch block.
+        let processor = qwen3_5_vl::ImageProcessor::new(&m.config().vision);
+        let (mut pixels, mut grids, mut placeholders) = (vec![], vec![], String::new());
+        for path in args.image.iter() {
+            let img = image::ImageReader::open(path)?.decode()?.to_rgb8();
+            let (h, w) = qwen3_5_vl::smart_resize(
+                img.height() as usize,
+                img.width() as usize,
+                processor.factor(),
+                processor.factor() * processor.factor(),
+                args.max_image_pixels,
+            )?;
+            let img = image::imageops::resize(
+                &img,
+                w as u32,
+                h as u32,
+                image::imageops::FilterType::CatmullRom,
+            );
+            let img = Tensor::from_vec(img.into_raw(), (h, w, 3), &Device::Cpu)?;
+            let (p, grid) = processor.preprocess(&img)?;
+            let n = grid.0 * grid.1 * grid.2 / processor.merge_size.pow(2);
+            placeholders.push_str(&format!(
+                "<|vision_start|>{}<|vision_end|>",
+                "<|image_pad|>".repeat(n)
+            ));
+            pixels.push(p.to_device(&device)?);
+            grids.push(grid);
+        }
+        pipeline.images = Some((Tensor::cat(&pixels, 0)?, grids));
+        user = format!("{placeholders}{user}");
+    } else if !args.image.is_empty() {
+        anyhow::bail!("--image needs a Qwen3.5 or Qwen3.8 model")
+    }
+    let prompt = format_prompt(&user, use_chat_template, thinking, args.model);
     match args.mtp_drafts {
         Some(drafts) => pipeline.run_mtp(&prompt, args.sample_len, drafts)?,
         None => pipeline.run(&prompt, args.sample_len)?,

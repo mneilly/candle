@@ -245,6 +245,68 @@ def run_mtp(model, mtp, prompt, steps):
     return ref
 
 
+def qwen3_5_vision_fixtures(out):
+    """The multimodal model: the image processor, the vision tower, the 3D rope positions, and the
+    language model with two images in its prompt, then cached decode steps."""
+    import numpy as np
+    from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+    from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
+
+    torch.manual_seed(0)
+    text = dict(
+        vocab_size=50, hidden_size=32, intermediate_size=48, num_hidden_layers=4,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, max_position_embeddings=256,
+        linear_conv_kernel_dim=4, linear_key_head_dim=8, linear_value_head_dim=8,
+        linear_num_key_heads=2, linear_num_value_heads=4, tie_word_embeddings=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5,
+                         "mrope_section": [2, 1, 1], "mrope_interleaved": True},
+    )
+    vision = dict(
+        depth=2, hidden_size=32, hidden_act="gelu_pytorch_tanh", intermediate_size=48, num_heads=2,
+        in_channels=3, patch_size=4, spatial_merge_size=2, temporal_patch_size=2, out_hidden_size=32,
+        num_position_embeddings=16, rope_parameters={"rope_type": "axial", "rope_theta": 10000.0},
+    )
+    cfg = Qwen3_5Config(text_config=text, vision_config=vision, image_token_id=45, video_token_id=44,
+                        vision_start_token_id=46, vision_end_token_id=47, tie_word_embeddings=True)
+    model = noisy(Qwen3_5ForConditionalGeneration(cfg), 0.05)
+    d = f"{out}/qwen3_5/vision"
+    os.makedirs(d, exist_ok=True)
+    save_file(tensors(model.state_dict(), skip=("lm_head.weight",)), f"{d}/model.safetensors")
+    dump_json(f"{d}/config.json", cfg.to_dict())
+
+    processor = Qwen2VLImageProcessorPil(patch_size=4, merge_size=2, temporal_patch_size=2,
+                                         image_mean=[0.5] * 3, image_std=[0.5] * 3, do_resize=False)
+    rng = np.random.default_rng(0)
+    images = [rng.integers(0, 256, (16, 24, 3), dtype=np.uint8), rng.integers(0, 256, (8, 8, 3), dtype=np.uint8)]
+    proc = processor(images=images, return_tensors="pt")
+    ref = {"image.0": torch.from_numpy(images[0]), "image.1": torch.from_numpy(images[1]),
+           "pixel_values": proc["pixel_values"], "image_grid_thw": proc["image_grid_thw"]}
+    # 6 and 1 merged tokens.
+    ids = [5, 46] + [45] * 6 + [47, 7, 8, 46, 45, 47, 9, 10]
+    input_ids = torch.tensor([ids])
+    mm = (input_ids == 45).int()
+    with torch.no_grad():
+        vis = model.model.visual(proc["pixel_values"], grid_thw=proc["image_grid_thw"])
+        ref["vision_out"] = vis.pooler_output
+        pos, delta = model.model.get_rope_index(input_ids, mm, image_grid_thw=proc["image_grid_thw"])
+        ref["position_ids"], ref["rope_delta"] = pos, delta
+        ref["input_ids"] = input_ids
+        o = model(input_ids=input_ids, pixel_values=proc["pixel_values"], image_grid_thw=proc["image_grid_thw"],
+                  mm_token_type_ids=mm, use_cache=True)
+        ref["prefill_logits"] = o.logits
+        cache = o.past_key_values
+        toks = o.logits[:, -1].argmax(-1, keepdim=True)
+        steps = []
+        for i in range(3):
+            steps.append(toks)
+            o = model(input_ids=toks, past_key_values=cache, use_cache=True)
+            cache = o.past_key_values
+            ref[f"decode_logits.{i}"] = o.logits
+            toks = o.logits[:, -1].argmax(-1, keepdim=True)
+        ref["decode_tokens"] = torch.cat(steps, 1)
+    save_ref(f"{d}/reference.safetensors", ref)
+
+
 def qwen4_exp_fixtures(out):
     from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
 
@@ -374,6 +436,7 @@ def main():
     if args.ncm_src:
         ncm_fixtures(args.out, args.ncm_src)
     qwen3_5_fixtures(args.out)
+    qwen3_5_vision_fixtures(args.out)
     qwen4_exp_fixtures(args.out)
     flux2_fixtures(args.out)
 

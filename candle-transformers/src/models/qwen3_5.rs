@@ -4,9 +4,10 @@
 //! linear-attention recurrence that compresses the prefix into a fixed-size state per head. The
 //! remaining layers use full softmax attention with an output gate, QK-norm and partial RoPE.
 //!
-//! Only the text model is implemented: for the multimodal checkpoints, the vision tower is
-//! ignored. The multi-token-prediction (MTP) head is loaded when the checkpoint has one, and
-//! drafts tokens for speculative decoding with [`Model::generate_mtp`].
+//! This is the language model; [`super::qwen3_5_vl`] adds the vision tower and images in the
+//! prompt, with multimodal RoPE positions ([`Model::forward_embeds`]). The multi-token-prediction
+//! (MTP) head is loaded when the checkpoint has one, and drafts tokens for speculative decoding
+//! with [`Model::generate_mtp`].
 //!
 //! - 📝 [Gated Delta Networks](https://arxiv.org/abs/2412.06464)
 //! - 🤗 [Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B),
@@ -34,6 +35,10 @@ pub struct RopeParameters {
     pub rope_theta: Option<f64>,
     #[serde(default)]
     pub partial_rotary_factor: Option<f64>,
+    /// The rotary frequencies of the temporal, height and width positions of multimodal RoPE,
+    /// interleaved; they sum to half the rotary dimension.
+    #[serde(default)]
+    pub mrope_section: Option<Vec<usize>>,
 }
 
 fn default_head_dim() -> usize {
@@ -213,18 +218,25 @@ pub(crate) struct RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
     rotary_dim: usize,
+    inv_freq: Vec<f32>,
+    mrope_section: Option<Vec<usize>>,
 }
 
 impl RotaryEmbedding {
     fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let rotary_dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor()) as usize;
-        Self::new_partial(
+        let mut rope = Self::new_partial(
             dtype,
             rotary_dim,
             cfg.rope_theta(),
             cfg.max_position_embeddings,
             dev,
-        )
+        )?;
+        rope.mrope_section = cfg
+            .rope_parameters
+            .as_ref()
+            .and_then(|r| r.mrope_section.clone());
+        Ok(rope)
     }
 
     /// RoPE over the first `rotary_dim` features of each head.
@@ -240,16 +252,55 @@ impl RotaryEmbedding {
             .map(|i| 1f32 / theta.powf(i as f64 / rotary_dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
+        let inv_freq_t = Tensor::from_vec(inv_freq.clone(), (1, inv_freq_len), dev)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
             .to_dtype(DType::F32)?
             .reshape((max_seq_len, 1))?;
-        let freqs = t.matmul(&inv_freq)?;
+        let freqs = t.matmul(&inv_freq_t)?;
         Ok(Self {
             sin: freqs.sin()?.to_dtype(dtype)?,
             cos: freqs.cos()?.to_dtype(dtype)?,
             rotary_dim,
+            inv_freq,
+            mrope_section: None,
         })
+    }
+
+    /// The `(seq, rotary_dim / 2)` cos and sin of `seq` positions from `start`.
+    pub(crate) fn cos_sin(&self, start: usize, seq: usize) -> Result<(Tensor, Tensor)> {
+        Ok((
+            self.cos.narrow(0, start, seq)?,
+            self.sin.narrow(0, start, seq)?,
+        ))
+    }
+
+    /// The cos and sin of multimodal RoPE for `(3, seq)` temporal, height and width positions:
+    /// frequency `j` reads the height position when `j % 3 == 1` and `j < 3 * section[1]`, the
+    /// width position when `j % 3 == 2` and `j < 3 * section[2]`, and the temporal one otherwise.
+    #[allow(clippy::needless_range_loop)]
+    pub(crate) fn mrope_cos_sin(&self, positions: &[Vec<u32>; 3]) -> Result<(Tensor, Tensor)> {
+        let half = self.inv_freq.len();
+        let section = match &self.mrope_section {
+            Some(s) if s.len() == 3 && s.iter().sum::<usize>() == half => s.clone(),
+            Some(s) => candle::bail!("mrope_section {s:?} does not sum to {half}"),
+            None => vec![half, 0, 0],
+        };
+        let seq = positions[0].len();
+        let mut freqs = Vec::with_capacity(seq * half);
+        for p in 0..seq {
+            for (j, f) in self.inv_freq.iter().enumerate() {
+                let axis = match j % 3 {
+                    1 if j < 3 * section[1] => 1,
+                    2 if j < 3 * section[2] => 2,
+                    _ => 0,
+                };
+                freqs.push(positions[axis][p] as f32 * f)
+            }
+        }
+        let dev = self.cos.device();
+        let freqs = Tensor::from_vec(freqs, (seq, half), dev)?;
+        let dtype = self.cos.dtype();
+        Ok((freqs.cos()?.to_dtype(dtype)?, freqs.sin()?.to_dtype(dtype)?))
     }
 
     /// Rotates the first `rotary_dim` features of a `(batch, heads, seq, head_dim)` tensor.
@@ -267,7 +318,7 @@ impl RotaryEmbedding {
         self.apply_cos_sin(xs, &cos, &sin)
     }
 
-    fn apply_cos_sin(&self, xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    pub(crate) fn apply_cos_sin(&self, xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let head_dim = xs.dim(D::Minus1)?;
         let rot = xs.narrow(D::Minus1, 0, self.rotary_dim)?.contiguous()?;
         let rot = candle_nn::rotary_emb::rope(&rot, cos, sin)?;
@@ -353,7 +404,7 @@ impl Attention {
         })
     }
 
-    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, rope: &Rope) -> Result<Tensor> {
         let (b, l, _) = xs.dims3()?;
         let hd = self.head_dim;
         let q_gate = self
@@ -376,8 +427,8 @@ impl Attention {
 
         let q = self.q_norm.forward(&q)?.transpose(1, 2)?;
         let k = self.k_norm.forward(&k)?.transpose(1, 2)?;
-        let q = self.rotary_emb.apply(&q, offset)?;
-        let k = self.rotary_emb.apply(&k, offset)?;
+        let q = self.rotary_emb.apply_cos_sin(&q, &rope.0, &rope.1)?;
+        let k = self.rotary_emb.apply_cos_sin(&k, &rope.0, &rope.1)?;
 
         let (k, v) = match &self.kv_cache {
             Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
@@ -405,6 +456,9 @@ impl Attention {
         self.kv_cache = None
     }
 }
+
+/// The `(seq, rotary_dim / 2)` cos and sin of the positions of a forward pass.
+type Rope = (Tensor, Tensor);
 
 /// The cached state of one layer.
 #[derive(Debug, Clone)]
@@ -767,11 +821,11 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, rope: &Rope) -> Result<Tensor> {
         let h = self.input_layernorm.forward(xs)?;
         let h = match &mut self.mixer {
             TokenMixer::Linear(m) => m.forward(&h)?,
-            TokenMixer::Full(m) => m.forward(&h, mask, offset)?,
+            TokenMixer::Full(m) => m.forward(&h, mask, rope)?,
         };
         let xs = (xs + h)?;
         let h = self
@@ -865,6 +919,10 @@ pub struct Model {
     norm: RmsNorm,
     lm_head: Linear,
     mtp: Option<Mtp>,
+    rotary: Arc<RotaryEmbedding>,
+    /// The RoPE position of cache position `p` is `p + rope_delta`: images take fewer positions
+    /// than tokens.
+    rope_delta: i64,
     device: Device,
     dtype: DType,
 }
@@ -901,7 +959,7 @@ impl Model {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         let mtp = if cfg.mtp_num_hidden_layers > 0 && vb.contains_tensor("mtp.fc.weight") {
-            Some(Mtp::new(cfg, rotary, vb.pp("mtp"))?)
+            Some(Mtp::new(cfg, rotary.clone(), vb.pp("mtp"))?)
         } else {
             None
         };
@@ -911,6 +969,8 @@ impl Model {
             norm,
             lm_head,
             mtp,
+            rotary,
+            rope_delta: 0,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -919,13 +979,61 @@ impl Model {
     /// Runs `input` `(batch, seq)` after `offset` already-processed tokens and returns the
     /// `(batch, seq, hidden)` final hidden states.
     pub fn forward_hidden(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let (_, l) = input.dims2()?;
+        let embeds = self.embed(input)?;
+        self.forward_embeds(&embeds, offset, None)
+    }
+
+    /// The `(batch, seq, hidden)` token embeddings of `input`.
+    pub fn embed(&self, input: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input)
+    }
+
+    /// Runs `(batch, seq, hidden)` input embeddings after `offset` cached positions and returns
+    /// the final hidden states. `positions` holds the temporal, height and width RoPE positions of
+    /// each input, as for images; without it the positions follow the cache, shifted by the RoPE
+    /// delta.
+    pub fn forward_embeds(
+        &mut self,
+        embeds: &Tensor,
+        offset: usize,
+        positions: Option<&[Vec<u32>; 3]>,
+    ) -> Result<Tensor> {
+        let (_, l, _) = embeds.dims3()?;
         let mask = self.causal_mask(l, offset)?;
-        let mut xs = self.embed_tokens.forward(input)?;
+        let rope = self.rope(l, offset, positions)?;
+        let mut xs = embeds.clone();
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, mask.as_ref(), offset)?;
+            xs = layer.forward(&xs, mask.as_ref(), &rope)?;
         }
         self.norm.forward(&xs)
+    }
+
+    fn rope(&self, l: usize, offset: usize, positions: Option<&[Vec<u32>; 3]>) -> Result<Rope> {
+        match positions {
+            Some(p) => {
+                if p.iter().any(|p| p.len() != l) {
+                    candle::bail!("expected {l} positions per axis")
+                }
+                self.rotary.mrope_cos_sin(p)
+            }
+            None => {
+                let start = offset as i64 + self.rope_delta;
+                if start < 0 {
+                    candle::bail!("negative RoPE position {start}")
+                }
+                self.rotary.cos_sin(start as usize, l)
+            }
+        }
+    }
+
+    /// Sets the shift between cache positions and RoPE positions after a multimodal prompt; it
+    /// is reset by [`Model::clear_kv_cache`].
+    pub fn set_rope_delta(&mut self, delta: i64) {
+        self.rope_delta = delta
+    }
+
+    pub fn rope_delta(&self) -> i64 {
+        self.rope_delta
     }
 
     fn causal_mask(&self, l: usize, offset: usize) -> Result<Option<Tensor>> {
@@ -957,6 +1065,7 @@ impl Model {
 
     /// Clears the KV caches and the recurrent states, to start a new sequence.
     pub fn clear_kv_cache(&mut self) {
+        self.rope_delta = 0;
         for layer in self.layers.iter_mut() {
             layer.clear_cache()
         }
@@ -1019,6 +1128,7 @@ impl Model {
     ) -> Result<Tensor> {
         let (_, l) = ids.dims2()?;
         let mask = self.causal_mask(l, offset)?;
+        let rope = self.rope(l, offset, None)?;
         let embeds = self.embed_tokens.forward(ids)?;
         let Some(mtp) = &mut self.mtp else {
             candle::bail!("the checkpoint has no MTP head")
@@ -1027,7 +1137,7 @@ impl Model {
         let h = mtp.pre_fc_norm_hidden.forward(hidden)?;
         let xs = Tensor::cat(&[e, h], D::Minus1)?.apply(&mtp.fc)?;
         let n = mtp.layers.len();
-        let xs = mtp.layers[step % n].forward(&xs, mask.as_ref(), offset)?;
+        let xs = mtp.layers[step % n].forward(&xs, mask.as_ref(), &rope)?;
         mtp.norm.forward(&xs)
     }
 
