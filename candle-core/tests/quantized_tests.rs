@@ -1834,3 +1834,47 @@ fn ternary_qtensors() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn gguf_raw_integer_tensors() -> Result<()> {
+    // A GGUF v3 file by hand: an F32 tensor, then an I32 index table, which has no GgmlDType
+    // and is kept as a raw tensor.
+    let mut f = Vec::new();
+    let put_str = |f: &mut Vec<u8>, s: &str| {
+        f.extend((s.len() as u64).to_le_bytes());
+        f.extend(s.as_bytes());
+    };
+    f.extend(b"GGUF");
+    f.extend(3u32.to_le_bytes());
+    f.extend(2u64.to_le_bytes()); // tensors
+    f.extend(0u64.to_le_bytes()); // metadata
+    for (name, ggml_type, n, offset) in [("w", 0u32, 4u64, 0u64), ("ids", 26, 3, 32)] {
+        put_str(&mut f, name);
+        f.extend(1u32.to_le_bytes());
+        f.extend(n.to_le_bytes());
+        f.extend(ggml_type.to_le_bytes());
+        f.extend(offset.to_le_bytes());
+    }
+    f.resize(f.len().div_ceil(32) * 32, 0);
+    let data_start = f.len();
+    for x in [1f32, 2., 3., 4.] {
+        f.extend(x.to_le_bytes());
+    }
+    f.resize(data_start + 32, 0);
+    for i in [7i32, -1, 40000] {
+        f.extend(i.to_le_bytes());
+    }
+    let mut reader = std::io::Cursor::new(f);
+    let content = quantized::gguf_file::Content::read(&mut reader)?;
+    let w = content.tensor(&mut reader, "w", &Device::Cpu)?;
+    assert_eq!(
+        w.dequantize(&Device::Cpu)?.to_vec1::<f32>()?,
+        [1., 2., 3., 4.]
+    );
+    assert!(!content.tensor_infos.contains_key("ids"));
+    let ids = &content.raw_tensor_infos["ids"];
+    assert_eq!((ids.ggml_type, ids.shape.dims()), (26, &[3][..]));
+    let ints = ids.read_ints(&mut reader, content.tensor_data_offset)?;
+    assert_eq!(ints, [7, -1, 40000]);
+    Ok(())
+}

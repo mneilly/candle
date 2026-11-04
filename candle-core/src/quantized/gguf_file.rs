@@ -119,11 +119,79 @@ impl TensorInfo {
     }
 }
 
+/// A tensor of a plain ggml type that is not a [`GgmlDType`]: `I8`, `I16`, `I32`, `I64` or
+/// `F64`, such as an index table. Read as raw little-endian bytes.
+#[derive(Debug)]
+pub struct RawTensorInfo {
+    /// The ggml type id.
+    pub ggml_type: u32,
+    pub shape: crate::Shape,
+    pub offset: u64,
+}
+
+impl RawTensorInfo {
+    /// The byte size of an element of a ggml type that has no [`GgmlDType`].
+    fn element_size(ggml_type: u32) -> Option<usize> {
+        match ggml_type {
+            24 => Some(1),      // I8
+            25 => Some(2),      // I16
+            26 => Some(4),      // I32
+            27 | 28 => Some(8), // I64, F64
+            _ => None,
+        }
+    }
+
+    pub fn read<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        tensor_data_offset: u64,
+    ) -> Result<Vec<u8>> {
+        let size = self.shape.elem_count() * Self::element_size(self.ggml_type).unwrap_or(0);
+        let start = tensor_data_offset.saturating_add(self.offset);
+        let file_size = reader.seek(std::io::SeekFrom::End(0))?;
+        if size as u64 > file_size.saturating_sub(start) {
+            crate::bail!("tensor needs {size} bytes at offset {start}, past the end of the file")
+        }
+        let mut data = vec![0u8; size];
+        reader.seek(std::io::SeekFrom::Start(start))?;
+        reader.read_exact(&mut data)?;
+        Ok(data)
+    }
+
+    /// The elements of an integer tensor as `i64`.
+    pub fn read_ints<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        tensor_data_offset: u64,
+    ) -> Result<Vec<i64>> {
+        let data = self.read(reader, tensor_data_offset)?;
+        let ints = match self.ggml_type {
+            24 => data.iter().map(|&b| b as i8 as i64).collect(),
+            25 => data
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as i64)
+                .collect(),
+            26 => data
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes(b.try_into().unwrap()) as i64)
+                .collect(),
+            27 => data
+                .chunks_exact(8)
+                .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+                .collect(),
+            t => crate::bail!("ggml type {t} is not an integer type"),
+        };
+        Ok(ints)
+    }
+}
+
 #[derive(Debug)]
 pub struct Content {
     pub magic: VersionedMagic,
     pub metadata: HashMap<String, Value>,
     pub tensor_infos: HashMap<String, TensorInfo>,
+    /// The tensors of plain types that are not a [`GgmlDType`], see [`RawTensorInfo`].
+    pub raw_tensor_infos: HashMap<String, RawTensorInfo>,
     pub tensor_data_offset: u64,
 }
 
@@ -512,6 +580,7 @@ impl Content {
             metadata.insert(key, value);
         }
         let mut tensor_infos = HashMap::new();
+        let mut raw_tensor_infos = HashMap::new();
         for _idx in 0..tensor_count {
             let tensor_name = read_string(reader, &magic, file_size)?;
             let n_dimensions = reader.read_u32::<LittleEndian>()?;
@@ -535,13 +604,23 @@ impl Content {
             };
 
             dimensions.reverse();
-            let ggml_dtype = reader.read_u32::<LittleEndian>()?;
-            let ggml_dtype = GgmlDType::from_u32(ggml_dtype)?;
+            let ggml_type = reader.read_u32::<LittleEndian>()?;
             let offset = reader.read_u64::<LittleEndian>()?;
+            let shape = crate::Shape::from(dimensions);
+            if RawTensorInfo::element_size(ggml_type).is_some() {
+                let info = RawTensorInfo {
+                    ggml_type,
+                    shape,
+                    offset,
+                };
+                raw_tensor_infos.insert(tensor_name, info);
+                continue;
+            }
+            let ggml_dtype = GgmlDType::from_u32(ggml_type)?;
             tensor_infos.insert(
                 tensor_name,
                 TensorInfo {
-                    shape: crate::Shape::from(dimensions),
+                    shape,
                     offset,
                     ggml_dtype,
                 },
@@ -562,6 +641,7 @@ impl Content {
             magic,
             metadata,
             tensor_infos,
+            raw_tensor_infos,
             tensor_data_offset,
         })
     }
