@@ -115,6 +115,18 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::Q2_0 => {
+                let vec: Vec<super::ternary::BlockQ2_0> = read_to_vec(&buffer, block_len);
+                super::ternary::BlockQ2_0::to_float(&vec, &mut out);
+            }
+            GgmlDType::PQ2_0 => {
+                let vec: Vec<super::ternary::BlockPQ2_0> = read_to_vec(&buffer, block_len);
+                super::ternary::BlockPQ2_0::to_float(&vec, &mut out);
+            }
+            GgmlDType::PTQ1_0 => {
+                let vec: Vec<super::ternary::BlockPTQ1_0> = read_to_vec(&buffer, block_len);
+                super::ternary::BlockPTQ1_0::to_float(&vec, &mut out);
+            }
         }
 
         let buffer = self
@@ -497,6 +509,10 @@ impl From<GgmlDType> for candle_metal_kernels::GgmlDType {
             GgmlDType::F16 => candle_metal_kernels::GgmlDType::F16,
             GgmlDType::F32 => candle_metal_kernels::GgmlDType::F32,
             GgmlDType::BF16 => candle_metal_kernels::GgmlDType::BF16,
+            // Loading these on Metal is refused, see `QStorage::from_data`.
+            GgmlDType::Q2_0 | GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 => {
+                panic!("{value:?} has no Metal kernels")
+            }
         }
     }
 }

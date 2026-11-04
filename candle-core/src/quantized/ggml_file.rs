@@ -149,6 +149,13 @@ pub fn qtensor_from_ggml(
         )
     }
     let size_in_bytes = tensor_elems / block_size * ggml_dtype.type_size();
+    let ternary = matches!(
+        ggml_dtype,
+        GgmlDType::Q2_0 | GgmlDType::PQ2_0 | GgmlDType::PTQ1_0
+    );
+    if ternary && !device.is_cpu() {
+        crate::bail!("{ggml_dtype:?} tensors are only supported on the CPU for now")
+    }
 
     match ggml_dtype {
         GgmlDType::F32 => from_raw_data::<f32>(raw_data, size_in_bytes, dims, device),
@@ -183,6 +190,15 @@ pub fn qtensor_from_ggml(
         }
         GgmlDType::Q6K => {
             from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q2_0 => {
+            from_raw_data::<super::ternary::BlockQ2_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::PQ2_0 => {
+            from_raw_data::<super::ternary::BlockPQ2_0>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::PTQ1_0 => {
+            from_raw_data::<super::ternary::BlockPTQ1_0>(raw_data, size_in_bytes, dims, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }

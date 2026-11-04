@@ -1117,6 +1117,10 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+        // Only ternary weights are representable, so a generic vector does not apply.
+        GgmlDType::Q2_0 | GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 => {
+            candle_core::bail!("no reference error for the ternary {dtype:?}")
+        }
     };
     Ok(err)
 }
@@ -1767,6 +1771,66 @@ fn bench_qmatmul_prefill_cpu() -> Result<()> {
                 m as f64 / secs
             );
         }
+    }
+    Ok(())
+}
+
+/// Ternary weights `scale * {-1, 0, 1}`, with a `+-scale` in every 128-wide block so that the
+/// block scales are exact.
+fn ternary_weights(rows: usize, cols: usize, scale: f32) -> Vec<f32> {
+    (0..rows * cols)
+        .map(|i| {
+            let t = if i % 128 == 0 { 1 } else { (i * 7 + i / 3) % 3 };
+            (t as f32 - 1.) * scale
+        })
+        .collect()
+}
+
+#[test]
+fn ternary_qtensors() -> Result<()> {
+    let dev = Device::Cpu;
+    let (n, k) = (6, 512);
+    let w = ternary_weights(n, k, 0.25);
+    let w = Tensor::from_vec(w, (n, k), &dev)?;
+    let x = Tensor::arange(0f32, (3 * k) as f32, &dev)?
+        .reshape((3, k))?
+        .affine(1. / k as f64, -1.)?
+        .sin()?;
+    let exact = x.matmul(&w.t()?)?;
+    for dtype in [GgmlDType::Q2_0, GgmlDType::PQ2_0, GgmlDType::PTQ1_0] {
+        let q = quantized::QTensor::quantize(&w, dtype)?;
+        assert_eq!(q.dtype(), dtype);
+        assert_eq!(
+            q.storage_size_in_bytes(),
+            n * k / dtype.block_size() * dtype.type_size()
+        );
+        // Ternary weights are stored exactly.
+        let back = q.dequantize(&dev)?;
+        assert_eq!(back.to_vec2::<f32>()?, w.to_vec2::<f32>()?, "{dtype:?}");
+        // The matmul rounds the activations to Q8_0, for one row (decode) and several (prefill).
+        let mm = quantized::QMatMul::from_qtensor(q)?;
+        for rows in [1, 3] {
+            let x = x.narrow(0, 0, rows)?;
+            let got = mm.forward(&x)?;
+            let diff = (got - exact.narrow(0, 0, rows)?)?.abs()?.max_all()?;
+            assert!(
+                diff.to_scalar::<f32>()? < 0.02,
+                "{dtype:?} {rows} rows: {diff}"
+            );
+        }
+
+        // GGUF stores them under their ggml type ids.
+        let q = quantized::QTensor::quantize(&w, dtype)?;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        quantized::gguf_file::write(&mut buf, &[], &[("w", &q)])?;
+        buf.set_position(0);
+        let content = quantized::gguf_file::Content::read(&mut buf)?;
+        assert_eq!(content.tensor_infos["w"].ggml_dtype, dtype);
+        let read = content.tensor(&mut buf, "w", &dev)?;
+        assert_eq!(
+            read.dequantize(&dev)?.to_vec2::<f32>()?,
+            w.to_vec2::<f32>()?
+        );
     }
     Ok(())
 }

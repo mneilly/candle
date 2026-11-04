@@ -3,6 +3,7 @@ use crate::{
 };
 use k_quants::*;
 use std::borrow::Cow;
+use ternary::*;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub mod avx;
@@ -17,6 +18,7 @@ pub mod metal;
 pub mod repack;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod repack_x86;
+pub mod ternary;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tokenizer;
 #[cfg(not(feature = "metal"))]
@@ -115,6 +117,9 @@ impl QStorage {
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::Q2_0 | GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 => {
+                    crate::bail!("{dtype:?} tensors are not supported on Metal yet")
+                }
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -132,6 +137,9 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::Q2_0 | GgmlDType::PQ2_0 | GgmlDType::PTQ1_0 => {
+                    crate::bail!("{dtype:?} tensors are not supported on CUDA yet")
+                }
             },
         }
     }
@@ -298,6 +306,12 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    /// Ternary weights in two-bit codes, 64 per fp16 scale.
+    Q2_0,
+    /// PrismML's `Q2_0` at 128 weights per scale.
+    PQ2_0,
+    /// PrismML's ternary weights packed as trits, 128 per scale.
+    PTQ1_0,
 }
 
 impl GgmlDType {
@@ -319,6 +333,10 @@ impl GgmlDType {
             15 => Self::Q8K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            42 => Self::Q2_0,
+            // PrismML-Eng/llama.cpp, ggml/include/ggml.h
+            142 => Self::PQ2_0,
+            143 => Self::PTQ1_0,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -342,6 +360,9 @@ impl GgmlDType {
             Self::Q8K => 15,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
+            Self::Q2_0 => 42,
+            Self::PQ2_0 => 142,
+            Self::PTQ1_0 => 143,
         }
     }
 
@@ -363,6 +384,9 @@ impl GgmlDType {
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+            Self::Q2_0 => Box::new(vec![BlockQ2_0::zeros(); elem_count / QK2_0]),
+            Self::PQ2_0 => Box::new(vec![BlockPQ2_0::zeros(); elem_count / QK_PQ2_0]),
+            Self::PTQ1_0 => Box::new(vec![BlockPTQ1_0::zeros(); elem_count / QK_PTQ1_0]),
         }
     }
 
@@ -384,6 +408,9 @@ impl GgmlDType {
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
+            Self::Q2_0 => Box::new(as_t_slice::<BlockQ2_0>(data).to_vec()),
+            Self::PQ2_0 => Box::new(as_t_slice::<BlockPQ2_0>(data).to_vec()),
+            Self::PTQ1_0 => Box::new(as_t_slice::<BlockPTQ1_0>(data).to_vec()),
         }
     }
 
@@ -406,6 +433,9 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::Q2_0 => std::mem::size_of::<BlockQ2_0>(),
+            Self::PQ2_0 => std::mem::size_of::<BlockPQ2_0>(),
+            Self::PTQ1_0 => std::mem::size_of::<BlockPTQ1_0>(),
         }
     }
 
@@ -421,6 +451,9 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            Self::Q2_0 => QK2_0,
+            Self::PQ2_0 => QK_PQ2_0,
+            Self::PTQ1_0 => QK_PTQ1_0,
         }
     }
 }

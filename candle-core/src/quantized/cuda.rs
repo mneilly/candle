@@ -691,6 +691,9 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
+            GgmlDType::Q2_0 => deq::<super::ternary::BlockQ2_0>(&buffer, block_len, &mut out),
+            GgmlDType::PQ2_0 => deq::<super::ternary::BlockPQ2_0>(&buffer, block_len, &mut out),
+            GgmlDType::PTQ1_0 => deq::<super::ternary::BlockPTQ1_0>(&buffer, block_len, &mut out),
         }
 
         self.device
