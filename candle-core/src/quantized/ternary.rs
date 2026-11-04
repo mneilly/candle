@@ -159,6 +159,17 @@ macro_rules! two_bit_block {
             }
 
             fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                if super::k_quants::has_avx2_fma() {
+                    let nb = n / $qk;
+                    return unsafe {
+                        let mut acc = super::avx::zeros();
+                        for (x, y) in xs[..nb].iter().zip(&ys[..nb]) {
+                            acc = super::avx::two_bit_block_dot(x.d.to_f32(), &x.qs, &y.0, acc);
+                        }
+                        super::avx::hsum(acc)
+                    };
+                }
                 Self::vec_dot_unopt(n, xs, ys)
             }
 
@@ -265,6 +276,18 @@ impl GgmlType for BlockPTQ1_0 {
     }
 
     fn vec_dot(n: usize, xs: &[Self], ys: &[Self::VecDotType]) -> f32 {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if super::k_quants::has_avx2_fma() {
+            let nb = n / QK_PTQ1_0;
+            return unsafe {
+                let mut acc = super::avx::zeros();
+                for (x, y) in xs[..nb].iter().zip(&ys[..nb]) {
+                    let codes = super::avx::ptq1_0_codes(&x.qs, &x.qh);
+                    acc = super::avx::codes_block_dot(x.d.to_f32(), &codes, &y.0, acc);
+                }
+                super::avx::hsum(acc)
+            };
+        }
         Self::vec_dot_unopt(n, xs, ys)
     }
 
@@ -398,7 +421,12 @@ mod tests {
             "{:?}: {got} vs {exact}",
             T::DTYPE
         );
-        assert_eq!(got, T::vec_dot_unopt(k, &qw, &qa));
+        // The SIMD kernels sum in another order.
+        let unopt = T::vec_dot_unopt(k, &qw, &qa);
+        assert!(
+            (got - unopt).abs() <= 1e-4 * unopt.abs().max(1.),
+            "{got} vs {unopt}"
+        );
     }
 
     #[test]
@@ -406,6 +434,21 @@ mod tests {
         check_vec_dot::<BlockQ2_0>(512);
         check_vec_dot::<BlockPQ2_0>(512);
         check_vec_dot::<BlockPTQ1_0>(512);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn simd_trit_decode_matches() {
+        if !super::super::k_quants::has_avx2_fma() {
+            return;
+        }
+        let xs = ternary(1024, 11, 1.);
+        let mut q = vec![BlockPTQ1_0::zeros(); 8];
+        BlockPTQ1_0::from_float(&xs, &mut q);
+        for b in &q {
+            let simd = unsafe { super::super::avx::ptq1_0_codes(&b.qs, &b.qh) };
+            assert_eq!(simd, b.decode().map(|q| (q + 1) as u8));
+        }
     }
 
     #[test]

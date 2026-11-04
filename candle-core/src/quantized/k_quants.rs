@@ -12,7 +12,7 @@ use half::{bf16, f16, slice::HalfFloatSliceExt};
 use super::repack::BlockQ4Kx8;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn has_avx2_fma() -> bool {
+pub(crate) fn has_avx2_fma() -> bool {
     let features = crate::cpu::features::get();
     features.avx2 && features.fma
 }

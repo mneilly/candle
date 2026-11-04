@@ -675,3 +675,100 @@ pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32
         hsum_float_8(acc)
     }
 }
+
+/// `sum((c - 1) * y)` over 32 unsigned codes `c` in `0..=3` against a Q8_0 block, as `i32` lanes
+/// converted to `f32`: `sum(c * y) - sum(y)`, exact for every `i8` activation.
+#[target_feature(enable = "avx2,fma")]
+fn ternary_codes_dot(c: __m256i, y: &BlockQ8_0) -> __m256 {
+    let y = unsafe { _mm256_loadu_si256(y.qs.as_ptr() as *const __m256i) };
+    let p = _mm256_sub_epi16(
+        _mm256_maddubs_epi16(c, y),
+        _mm256_maddubs_epi16(_mm256_set1_epi8(1), y),
+    );
+    sum_i16_pairs_float(p)
+}
+
+/// The 32 two-bit codes of 8 bytes, four consecutive weights per byte from the low bits: byte `b`
+/// spreads to `b, b << 6, b << 12, b << 18` in its own `u32` lane, so that byte `j` of the lane
+/// holds bits `2j..2j + 2` of `b` once masked.
+#[target_feature(enable = "avx2,fma")]
+fn unpack_two_bit_32(qs: &[u8]) -> __m256i {
+    debug_assert!(qs.len() >= 8);
+    let v = _mm256_cvtepu8_epi32(unsafe { _mm_loadl_epi64(qs.as_ptr() as *const __m128i) });
+    let v = _mm256_or_si256(v, _mm256_slli_epi32(v, 12));
+    let v = _mm256_or_si256(v, _mm256_slli_epi32(v, 6));
+    _mm256_and_si256(v, _mm256_set1_epi32(0x03030303))
+}
+
+/// `d * sum_k d_k * sum((c - 1) * y_k)` for one block of two-bit codes `qs`, covering one Q8_0
+/// block `y_k` per 8 bytes, added to `acc`.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn two_bit_block_dot(d: f32, qs: &[u8], ys: &[BlockQ8_0], acc: __m256) -> __m256 {
+    let mut acc = acc;
+    for (qs, y) in qs.chunks_exact(8).zip(ys) {
+        let p = ternary_codes_dot(unpack_two_bit_32(qs), y);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * y.d.to_f32()), p, acc);
+    }
+    acc
+}
+
+/// As [`two_bit_block_dot`], for unsigned codes in `0..=2` already one per byte.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn codes_block_dot(d: f32, codes: &[u8], ys: &[BlockQ8_0], acc: __m256) -> __m256 {
+    let mut acc = acc;
+    for (c, y) in codes.chunks_exact(QK8_0).zip(ys) {
+        let c = unsafe { _mm256_loadu_si256(c.as_ptr() as *const __m256i) };
+        let p = ternary_codes_dot(c, y);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d * y.d.to_f32()), p, acc);
+    }
+    acc
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn hsum(acc: __m256) -> f32 {
+    hsum_float_8(acc)
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn zeros() -> __m256 {
+    _mm256_setzero_ps()
+}
+
+/// The unsigned trit codes `0..=2` of a PTQ1_0 block, in weight order: `qs[..16]` holds weights
+/// `n * 16 + m` as trit `n` of byte `m`, `qs[16..]` weights `80 + n * 8 + m`, and `qh` weights
+/// `120 + n * 2 + h`. Trit `n` of a byte `b` is `((b * 3^n mod 256) * 3) >> 8`.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn ptq1_0_codes(qs: &[u8; 24], qh: &[u8; 2]) -> [u8; 128] {
+    const POW3: [i16; 5] = [1, 3, 9, 27, 81];
+    let mut out = [0u8; 128];
+    let low = _mm256_set1_epi16(0xff);
+    let three = _mm256_set1_epi16(3);
+    let v = _mm256_cvtepu8_epi16(unsafe { _mm_loadu_si128(qs.as_ptr() as *const __m128i) });
+    for (n, &p) in POW3.iter().enumerate() {
+        let t = _mm256_and_si256(_mm256_mullo_epi16(v, _mm256_set1_epi16(p)), low);
+        let t = _mm256_srli_epi16(_mm256_mullo_epi16(t, three), 8);
+        // Pack the 16 lanes to bytes; the pack works per 128-bit half.
+        let t = _mm256_packus_epi16(t, t);
+        let t = _mm256_permute4x64_epi64(t, 0b11_01_10_00);
+        unsafe {
+            _mm_storeu_si128(
+                out.as_mut_ptr().add(16 * n) as *mut __m128i,
+                _mm256_castsi256_si128(t),
+            )
+        };
+    }
+    let v = _mm_cvtepu8_epi16(unsafe { _mm_loadl_epi64(qs.as_ptr().add(16) as *const __m128i) });
+    for (n, &p) in POW3.iter().enumerate() {
+        let t = _mm_and_si128(_mm_mullo_epi16(v, _mm_set1_epi16(p)), _mm_set1_epi16(0xff));
+        let t = _mm_srli_epi16(_mm_mullo_epi16(t, _mm_set1_epi16(3)), 8);
+        let t = _mm_packus_epi16(t, t);
+        unsafe { _mm_storel_epi64(out.as_mut_ptr().add(80 + 8 * n) as *mut __m128i, t) };
+    }
+    for n in 0..4 {
+        for (h, &b) in qh.iter().enumerate() {
+            let t = b.wrapping_mul(POW3[n] as u8) as u16;
+            out[120 + 2 * n + h] = ((t * 3) >> 8) as u8;
+        }
+    }
+    out
+}
