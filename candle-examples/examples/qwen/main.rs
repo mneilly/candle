@@ -142,6 +142,62 @@ impl TextGeneration {
         );
         Ok(())
     }
+
+    /// Greedy decoding with the Qwen3.5 MTP head drafting `drafts` tokens per step.
+    fn run_mtp(&mut self, prompt: &str, sample_len: usize, drafts: usize) -> Result<()> {
+        use std::io::Write;
+        let Model::Base35(model) = &mut self.model else {
+            anyhow::bail!("--mtp-drafts needs a Qwen3.5 or Qwen3.8 model")
+        };
+        if !model.has_mtp() {
+            anyhow::bail!("the checkpoint has no MTP weights")
+        }
+        self.tokenizer.clear();
+        let tokens = self
+            .tokenizer
+            .tokenizer()
+            .encode(prompt, true)
+            .map_err(E::msg)?
+            .get_ids()
+            .to_vec();
+        for &t in tokens.iter() {
+            if let Some(t) = self.tokenizer.next_token(t)? {
+                print!("{t}")
+            }
+        }
+        std::io::stdout().flush()?;
+        let eos = ["<|endoftext|>", "<|im_end|>"]
+            .iter()
+            .filter_map(|t| self.tokenizer.get_token(t))
+            .collect::<Vec<_>>();
+        let input = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
+        let mut generated_tokens = 0usize;
+        let tokenizer = &mut self.tokenizer;
+        let start_gen = std::time::Instant::now();
+        let stats = model.generate_mtp(&input, sample_len, drafts, |t| {
+            generated_tokens += 1;
+            if eos.contains(&t) {
+                return Ok(false);
+            }
+            if let Some(t) = tokenizer.next_token(t).map_err(candle::Error::wrap)? {
+                print!("{t}");
+                std::io::stdout().flush()?;
+            }
+            Ok(true)
+        })?;
+        let dt = start_gen.elapsed();
+        if let Some(rest) = self.tokenizer.decode_rest().map_err(E::msg)? {
+            print!("{rest}");
+        }
+        println!(
+            "\n{generated_tokens} tokens generated ({:.2} token/s), {} of {} drafts accepted in {} steps",
+            generated_tokens as f64 / dt.as_secs_f64(),
+            stats.accepted,
+            stats.drafted,
+            stats.rounds,
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, PartialEq, Eq)]
@@ -242,6 +298,11 @@ struct Args {
     /// Skip chat template formatting (use raw prompt, like base model)
     #[arg(long)]
     no_chat_template: bool,
+
+    /// Speculative decoding for Qwen3.5 and Qwen3.8: the checkpoint's MTP head drafts this many
+    /// tokens per step. Decoding is then greedy, without repeat penalty.
+    #[arg(long)]
+    mtp_drafts: Option<usize>,
 
     /// Enable thinking/reasoning mode (allows model to show its reasoning process)
     #[arg(long)]
@@ -459,6 +520,9 @@ fn main() -> Result<()> {
         &device,
     );
     let prompt = format_prompt(&args.prompt, use_chat_template, thinking, args.model);
-    pipeline.run(&prompt, args.sample_len)?;
+    match args.mtp_drafts {
+        Some(drafts) => pipeline.run_mtp(&prompt, args.sample_len, drafts)?,
+        None => pipeline.run(&prompt, args.sample_len)?,
+    }
     Ok(())
 }

@@ -6,8 +6,8 @@
 
 mod common;
 
-use candle::DType;
-use candle_transformers::models::qwen3_5::{Config, LayerType, Model};
+use candle::{DType, Device, Tensor};
+use candle_transformers::models::qwen3_5::{Config, LayerType, Model, MtpStats};
 use common::{assert_close, load, read, vb};
 
 fn model(variant: &str) -> (Model, Config) {
@@ -125,4 +125,186 @@ fn config_defaults() {
     assert!(!cfg.tie_word_embeddings && !cfg.attention_bias);
     let mm = Config::from_json(&format!(r#"{{"text_config": {text}}}"#)).unwrap();
     assert_eq!(mm, cfg);
+}
+
+/// The MTP head over the prompt, teacher-forced with the main model's hidden states, then
+/// chained drafts through its cache.
+#[test]
+fn mtp_matches_reference() {
+    let (mut model, cfg) = model("text");
+    assert_eq!(cfg.mtp_num_hidden_layers, 1);
+    assert!(model.has_mtp());
+    let r = load("qwen3_5/text/mtp_reference.safetensors").unwrap();
+    let prompt = load("qwen3_5/text/reference.safetensors").unwrap()["prompt"]
+        .to_dtype(DType::U32)
+        .unwrap();
+    let p = prompt.dim(1).unwrap();
+    let hidden = model.forward_hidden(&prompt, 0).unwrap();
+    assert_close(&hidden, &r["main_hidden"], 1e-4, "main hidden");
+    let g = model
+        .mtp_forward_hidden(
+            &prompt.narrow(1, 1, p - 1).unwrap(),
+            &hidden.narrow(1, 0, p - 1).unwrap(),
+            0,
+            0,
+        )
+        .unwrap();
+    assert_close(&g, &r["teacher_hidden"], 1e-4, "teacher hidden");
+    assert_close(
+        &model.logits(&g).unwrap(),
+        &r["teacher_logits"],
+        1e-4,
+        "teacher logits",
+    );
+    let inputs = r["draft_inputs"].to_dtype(DType::U32).unwrap();
+    let mut h = hidden.narrow(1, p - 1, 1).unwrap();
+    for i in 0..inputs.dim(1).unwrap() {
+        let ids = inputs.narrow(1, i, 1).unwrap();
+        h = model.mtp_forward_hidden(&ids, &h, p - 1 + i, i).unwrap();
+        let logits = model.logits(&h).unwrap();
+        assert_close(&logits, &r[&format!("draft_logits.{i}")], 1e-4, "draft");
+    }
+}
+
+fn greedy(model: &mut Model, prompt: &Tensor, n: usize) -> Vec<u32> {
+    model.clear_kv_cache();
+    let mut tokens = vec![];
+    let mut logits = model.forward(prompt, 0).unwrap();
+    for i in 0..n {
+        let t = logits.flatten_all().unwrap().argmax(0).unwrap();
+        tokens.push(t.to_scalar::<u32>().unwrap());
+        let ids = t.reshape((1, 1)).unwrap();
+        logits = model.forward(&ids, prompt.dim(1).unwrap() + i).unwrap();
+    }
+    tokens
+}
+
+fn mtp_tokens(model: &mut Model, prompt: &Tensor, n: usize, drafts: usize) -> (Vec<u32>, MtpStats) {
+    let mut tokens = vec![];
+    let stats = model
+        .generate_mtp(prompt, n, drafts, |t| {
+            tokens.push(t);
+            Ok(true)
+        })
+        .unwrap();
+    (tokens, stats)
+}
+
+#[test]
+fn generate_mtp_matches_greedy() {
+    let (mut model, _) = model("text");
+    let r = load("qwen3_5/text/reference.safetensors").unwrap();
+    let prompt = r["prompt"].to_dtype(DType::U32).unwrap();
+    for row in 0..2 {
+        let prompt = prompt.narrow(0, row, 1).unwrap();
+        let expected = greedy(&mut model, &prompt, 24);
+        for drafts in 1..=3 {
+            let (tokens, stats) = mtp_tokens(&mut model, &prompt, 24, drafts);
+            assert_eq!(tokens, expected, "row {row}, {drafts} drafts");
+            assert_eq!(stats.drafted, stats.rounds * drafts);
+            assert!(stats.accepted <= stats.drafted);
+            // The prompt pass gives one token, each round its accepted drafts and one more.
+            assert!(1 + stats.rounds + stats.accepted >= 24);
+            assert!(1 + (stats.rounds - 1) + stats.accepted < 24);
+        }
+    }
+}
+
+#[test]
+fn generate_mtp_stops() {
+    let (mut model, _) = model("text");
+    let r = load("qwen3_5/text/reference.safetensors").unwrap();
+    let prompt = r["prompt"].to_dtype(DType::U32).unwrap();
+    let prompt = prompt.narrow(0, 0, 1).unwrap();
+    let expected = greedy(&mut model, &prompt, 5);
+    for n in 0..=5 {
+        let (tokens, _) = mtp_tokens(&mut model, &prompt, n, 2);
+        assert_eq!(tokens, expected[..n], "max_new {n}");
+    }
+    // on_token stops the generation after the token it returns false on.
+    for stop in 1..=5 {
+        let mut tokens = vec![];
+        model
+            .generate_mtp(&prompt, 10, 3, |t| {
+                tokens.push(t);
+                Ok(tokens.len() < stop)
+            })
+            .unwrap();
+        assert_eq!(tokens, expected[..stop], "stop after {stop}");
+    }
+    let err = model
+        .generate_mtp(&prompt, 4, 0, |_| Ok(true))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("at least one draft"), "{err}");
+}
+
+#[test]
+fn mtp_is_optional() {
+    // The multimodal fixture has no MTP weights, and a zero layer count skips them.
+    let (mut mm, _) = model("multimodal");
+    assert!(!mm.has_mtp());
+    let ids = Tensor::new(&[[1u32]], &Device::Cpu).unwrap();
+    let h = Tensor::zeros((1, 1, 32), DType::F32, &Device::Cpu).unwrap();
+    let err = mm
+        .mtp_forward_hidden(&ids, &h, 0, 0)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no MTP head"), "{err}");
+    let mut cfg = Config::from_json(&read("qwen3_5/text/config.json")).unwrap();
+    cfg.mtp_num_hidden_layers = 0;
+    let text = Model::new(&cfg, vb(&["qwen3_5/text/model.safetensors"]).unwrap()).unwrap();
+    assert!(!text.has_mtp());
+}
+
+#[test]
+fn cache_snapshots_roll_back() {
+    let (mut model, _) = model("text");
+    let r = load("qwen3_5/text/reference.safetensors").unwrap();
+    let prompt = r["prompt"].to_dtype(DType::U32).unwrap();
+    let cont = r["cont"].to_dtype(DType::U32).unwrap();
+    let p = prompt.dim(1).unwrap();
+    model.forward(&prompt, 0).unwrap();
+    let snapshot = model.cache();
+    let first = model.forward_all(&cont, p).unwrap();
+    model.forward_all(&cont, p + cont.dim(1).unwrap()).unwrap();
+    model.set_cache(snapshot).unwrap();
+    assert_close(
+        &model.forward_all(&cont, p).unwrap(),
+        &first,
+        0.,
+        "rolled back",
+    );
+    // A snapshot of another model does not fit.
+    let mut cfg = Config::from_json(&read("qwen3_5/text/config.json")).unwrap();
+    cfg.mtp_num_hidden_layers = 0;
+    let mm = Model::new(&cfg, vb(&["qwen3_5/text/model.safetensors"]).unwrap()).unwrap();
+    let err = model.set_cache(mm.cache()).unwrap_err().to_string();
+    assert!(err.contains("another model"), "{err}");
+    // Nor does one with the layer types in another order.
+    let mut cfg = Config::from_json(&read("qwen3_5/text/config.json")).unwrap();
+    let mut types = cfg.layer_types();
+    types.reverse();
+    cfg.layer_types = Some(types);
+    let zeros = candle_nn::VarBuilder::zeros(DType::F32, &Device::Cpu);
+    let other = Model::new(&cfg, zeros).unwrap();
+    let err = model.set_cache(other.cache()).unwrap_err().to_string();
+    assert!(err.contains("another layer type"), "{err}");
+}
+
+#[test]
+fn generate_mtp_accepts_every_matching_draft() {
+    // With zero weights every logit is zero, so the model and its MTP head both pick token 0
+    // and every draft is accepted.
+    let cfg = Config::from_json(&read("qwen3_5/text/config.json")).unwrap();
+    let vb = candle_nn::VarBuilder::zeros(DType::F32, &Device::Cpu);
+    let mut model = Model::new(&cfg, vb).unwrap();
+    assert!(model.has_mtp());
+    let prompt = Tensor::new(&[[1u32, 2, 3]], &Device::Cpu).unwrap();
+    for drafts in 1..=3 {
+        let (tokens, stats) = mtp_tokens(&mut model, &prompt, 13, drafts);
+        assert_eq!(tokens, vec![0; 13]);
+        assert_eq!(stats.accepted, stats.drafted, "{drafts} drafts");
+        assert_eq!(stats.rounds, 12usize.div_ceil(drafts + 1));
+    }
 }

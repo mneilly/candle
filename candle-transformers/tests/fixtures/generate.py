@@ -174,9 +174,75 @@ def qwen3_5_fixtures(out):
             config = {"model_type": "qwen3_5", "text_config": config, "tie_word_embeddings": True}
         d = f"{out}/qwen3_5/{name}"
         os.makedirs(d, exist_ok=True)
+        ref = run_lm(model, 50, 2, 70, 2, 20)
+        if not multimodal:
+            # The MTP draft head, created after the reference run so that the main model's
+            # references are unchanged.
+            mtp = noisy(Qwen3_5Mtp(cfg), 0.05)
+            sd.update({f"mtp.{k}": v for k, v in tensors(mtp.state_dict()).items()})
+            config["mtp_num_hidden_layers"] = 1
+            save_ref(f"{d}/mtp_reference.safetensors", run_mtp(model, mtp, ref["prompt"], 3))
         save_file(sd, f"{d}/model.safetensors")
         dump_json(f"{d}/config.json", config)
-        save_ref(f"{d}/reference.safetensors", run_lm(model, 50, 2, 70, 2, 20))
+        save_ref(f"{d}/reference.safetensors", ref)
+
+
+class Qwen3_5Mtp(torch.nn.Module):
+    """The Qwen3.5 multi-token prediction head as vLLM runs it (`Qwen3_5MultiTokenPredictor`):
+    fc(concat(norm(embed(token)), norm(hidden))) through full-attention decoder layers, then a
+    final norm, sharing the main model's embeddings and LM head. transformers skips `mtp.*`."""
+
+    def __init__(self, cfg):
+        import copy
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
+
+        super().__init__()
+        c = copy.deepcopy(cfg)
+        c.num_hidden_layers = 1
+        c.layer_types = ["full_attention"]
+        h, eps = cfg.hidden_size, cfg.rms_norm_eps
+        self.fc = torch.nn.Linear(2 * h, h, bias=False)
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(h, eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(h, eps)
+        self.layers = torch.nn.ModuleList([Qwen3_5DecoderLayer(c, 0)])
+        self.norm = Qwen3_5RMSNorm(h, eps)
+
+    def forward(self, model, ids, hidden):
+        """Uncached: the normed MTP outputs for tokens `ids` paired with `hidden`, at positions
+        0, 1, ..."""
+        n = ids.shape[1]
+        e = self.pre_fc_norm_embedding(model.model.embed_tokens(ids))
+        x = self.fc(torch.cat([e, self.pre_fc_norm_hidden(hidden)], -1))
+        pos = torch.arange(n)[None].expand(ids.shape[0], -1)
+        rope = model.model.rotary_emb(x, pos)
+        mask = torch.full((n, n), float("-inf")).triu(1)[None, None]
+        for layer in self.layers:
+            x = layer(x, position_embeddings=rope, attention_mask=mask, position_ids=pos)
+        return self.norm(x)
+
+
+def run_mtp(model, mtp, prompt, steps):
+    """Teacher-forced MTP over the prompt (each token paired with the main hidden state before
+    it), then `steps` chained greedy drafts after the prompt."""
+    with torch.no_grad():
+        hidden = model.model(prompt).last_hidden_state
+        ref = {"main_hidden": hidden}
+        ids, hs = prompt[:, 1:], hidden[:, :-1]
+        g = mtp(model, ids, hs)
+        ref["teacher_logits"] = model.lm_head(g)
+        ref["teacher_hidden"] = g
+        tok = model.lm_head(hidden[:, -1:]).argmax(-1)
+        h = hidden[:, -1:]
+        drafts = []
+        for i in range(steps):
+            ids, hs = torch.cat([ids, tok], 1), torch.cat([hs, h], 1)
+            g = mtp(model, ids, hs)
+            logits = model.lm_head(g[:, -1:])
+            ref[f"draft_logits.{i}"] = logits
+            drafts.append(tok)
+            tok, h = logits.argmax(-1), g[:, -1:]
+        ref["draft_inputs"] = torch.cat(drafts, 1)
+    return ref
 
 
 def qwen4_exp_fixtures(out):

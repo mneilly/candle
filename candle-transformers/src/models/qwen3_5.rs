@@ -4,8 +4,9 @@
 //! linear-attention recurrence that compresses the prefix into a fixed-size state per head. The
 //! remaining layers use full softmax attention with an output gate, QK-norm and partial RoPE.
 //!
-//! Only the text model is implemented: for the multimodal checkpoints, the vision tower and the
-//! multi-token-prediction weights are ignored.
+//! Only the text model is implemented: for the multimodal checkpoints, the vision tower is
+//! ignored. The multi-token-prediction (MTP) head is loaded when the checkpoint has one, and
+//! drafts tokens for speculative decoding with [`Model::generate_mtp`].
 //!
 //! - 📝 [Gated Delta Networks](https://arxiv.org/abs/2412.06464)
 //! - 🤗 [Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B),
@@ -82,6 +83,10 @@ pub struct Config {
     pub rope_theta: Option<f64>,
     #[serde(default)]
     pub partial_rotary_factor: Option<f64>,
+    /// The number of MTP layers; the MTP head is loaded when this is non-zero and the checkpoint
+    /// has its weights.
+    #[serde(default)]
+    pub mtp_num_hidden_layers: usize,
 }
 
 #[derive(serde::Deserialize)]
@@ -399,6 +404,24 @@ impl Attention {
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None
     }
+}
+
+/// The cached state of one layer.
+#[derive(Debug, Clone)]
+enum LayerCache {
+    Linear {
+        conv: Option<Tensor>,
+        recurrent: Option<Tensor>,
+    },
+    Full(Option<(Tensor, Tensor)>),
+}
+
+/// A snapshot of every cache of a [`Model`], MTP layers included, to roll a sequence back.
+/// Tensors are shared, so taking one is cheap.
+#[derive(Debug, Clone)]
+pub struct Cache {
+    layers: Vec<LayerCache>,
+    mtp_layers: Vec<LayerCache>,
 }
 
 /// `x / sqrt(sum(x^2) + eps)` over the last dimension.
@@ -764,6 +787,75 @@ impl DecoderLayer {
             TokenMixer::Full(m) => m.clear_kv_cache(),
         }
     }
+
+    fn cache(&self) -> LayerCache {
+        match &self.mixer {
+            TokenMixer::Linear(m) => LayerCache::Linear {
+                conv: m.conv_state.clone(),
+                recurrent: m.recurrent_state.clone(),
+            },
+            TokenMixer::Full(m) => LayerCache::Full(m.kv_cache.clone()),
+        }
+    }
+
+    fn set_cache(&mut self, cache: LayerCache) -> Result<()> {
+        match (&mut self.mixer, cache) {
+            (TokenMixer::Linear(m), LayerCache::Linear { conv, recurrent }) => {
+                m.conv_state = conv;
+                m.recurrent_state = recurrent;
+            }
+            (TokenMixer::Full(m), LayerCache::Full(kv)) => m.kv_cache = kv,
+            _ => candle::bail!("cache of another layer type"),
+        }
+        Ok(())
+    }
+}
+
+/// The multi-token-prediction head: `fc(concat(norm(embed(token)), norm(hidden)))` through
+/// full-attention decoder layers and a final norm, sharing the model's embeddings and LM head.
+/// Paired with the normed hidden state of a position, the token at the next position predicts
+/// the token after it.
+#[derive(Debug, Clone)]
+struct Mtp {
+    fc: Linear,
+    pre_fc_norm_embedding: RmsNorm,
+    pre_fc_norm_hidden: RmsNorm,
+    layers: Vec<DecoderLayer>,
+    norm: RmsNorm,
+}
+
+impl Mtp {
+    fn new(cfg: &Config, rotary: Arc<RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
+        let (h, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
+        let layers = (0..cfg.mtp_num_hidden_layers)
+            .map(|i| {
+                DecoderLayer::new(
+                    cfg,
+                    LayerType::FullAttention,
+                    rotary.clone(),
+                    vb.pp("layers").pp(i),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            fc: linear_no_bias(2 * h, h, vb.pp("fc"))?,
+            pre_fc_norm_embedding: RmsNorm::new(h, eps, vb.pp("pre_fc_norm_embedding"))?,
+            pre_fc_norm_hidden: RmsNorm::new(h, eps, vb.pp("pre_fc_norm_hidden"))?,
+            layers,
+            norm: RmsNorm::new(h, eps, vb.pp("norm"))?,
+        })
+    }
+}
+
+/// Counts of a [`Model::generate_mtp`] run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MtpStats {
+    /// Main-model passes after the prompt, one per round of drafts.
+    pub rounds: usize,
+    /// Tokens drafted by the MTP head.
+    pub drafted: usize,
+    /// Drafted tokens the main model accepted.
+    pub accepted: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -772,6 +864,7 @@ pub struct Model {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
+    mtp: Option<Mtp>,
     device: Device,
     dtype: DType,
 }
@@ -807,11 +900,17 @@ impl Model {
         } else {
             linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
+        let mtp = if cfg.mtp_num_hidden_layers > 0 && vb.contains_tensor("mtp.fc.weight") {
+            Some(Mtp::new(cfg, rotary, vb.pp("mtp"))?)
+        } else {
+            None
+        };
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            mtp,
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -821,22 +920,26 @@ impl Model {
     /// `(batch, seq, hidden)` final hidden states.
     pub fn forward_hidden(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let (_, l) = input.dims2()?;
-        let mask = if l > 1 {
-            Some(crate::utils::build_additive_causal_mask(
-                l,
-                offset,
-                None,
-                &self.device,
-                self.dtype,
-            )?)
-        } else {
-            None
-        };
+        let mask = self.causal_mask(l, offset)?;
         let mut xs = self.embed_tokens.forward(input)?;
         for layer in self.layers.iter_mut() {
             xs = layer.forward(&xs, mask.as_ref(), offset)?;
         }
         self.norm.forward(&xs)
+    }
+
+    fn causal_mask(&self, l: usize, offset: usize) -> Result<Option<Tensor>> {
+        if l == 1 {
+            return Ok(None);
+        }
+        let mask =
+            crate::utils::build_additive_causal_mask(l, offset, None, &self.device, self.dtype)?;
+        Ok(Some(mask))
+    }
+
+    /// Applies the LM head to `(batch, seq, hidden)` normed hidden states.
+    pub fn logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        hidden.apply(&self.lm_head)
     }
 
     /// Returns the `(batch, 1, vocab)` logits of the last position.
@@ -856,6 +959,171 @@ impl Model {
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_cache()
+        }
+        for layer in self.mtp_layers_mut() {
+            layer.clear_cache()
+        }
+    }
+
+    fn mtp_layers_mut(&mut self) -> &mut [DecoderLayer] {
+        match &mut self.mtp {
+            Some(mtp) => &mut mtp.layers,
+            None => &mut [],
+        }
+    }
+
+    /// A snapshot of every cache, to return to with [`Model::set_cache`].
+    pub fn cache(&self) -> Cache {
+        let mtp_layers = match &self.mtp {
+            Some(mtp) => mtp.layers.iter().map(|l| l.cache()).collect(),
+            None => vec![],
+        };
+        Cache {
+            layers: self.layers.iter().map(|l| l.cache()).collect(),
+            mtp_layers,
+        }
+    }
+
+    /// Returns every cache to a snapshot taken with [`Model::cache`].
+    pub fn set_cache(&mut self, cache: Cache) -> Result<()> {
+        if cache.layers.len() != self.layers.len()
+            || cache.mtp_layers.len() != self.mtp_layers_mut().len()
+        {
+            candle::bail!("cache of another model")
+        }
+        for (layer, c) in self.layers.iter_mut().zip(cache.layers) {
+            layer.set_cache(c)?
+        }
+        for (layer, c) in self.mtp_layers_mut().iter_mut().zip(cache.mtp_layers) {
+            layer.set_cache(c)?
+        }
+        Ok(())
+    }
+
+    /// Whether the checkpoint has an MTP head.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// Runs the MTP head on tokens `ids` `(batch, seq)`, each paired with `hidden`
+    /// `(batch, seq, hidden)`, the normed hidden state of the position before it, at MTP cache
+    /// positions from `offset`. Draft step `step` uses MTP layer `step % mtp_num_hidden_layers`.
+    /// Returns the normed `(batch, seq, hidden)` outputs: their logits predict the token after
+    /// each of `ids`, and an output paired with the drafted token chains the next draft.
+    pub fn mtp_forward_hidden(
+        &mut self,
+        ids: &Tensor,
+        hidden: &Tensor,
+        offset: usize,
+        step: usize,
+    ) -> Result<Tensor> {
+        let (_, l) = ids.dims2()?;
+        let mask = self.causal_mask(l, offset)?;
+        let embeds = self.embed_tokens.forward(ids)?;
+        let Some(mtp) = &mut self.mtp else {
+            candle::bail!("the checkpoint has no MTP head")
+        };
+        let e = mtp.pre_fc_norm_embedding.forward(&embeds)?;
+        let h = mtp.pre_fc_norm_hidden.forward(hidden)?;
+        let xs = Tensor::cat(&[e, h], D::Minus1)?.apply(&mtp.fc)?;
+        let n = mtp.layers.len();
+        let xs = mtp.layers[step % n].forward(&xs, mask.as_ref(), offset)?;
+        mtp.norm.forward(&xs)
+    }
+
+    /// Greedy decoding of a `(1, seq)` prompt with the MTP head drafting `drafts` tokens per
+    /// main-model pass, which verifies them all at once. The tokens are those of plain greedy
+    /// decoding, up to rounding. Starts from cleared caches; `on_token` receives each new token
+    /// and returns whether to go on, and generation stops after `max_new` tokens.
+    ///
+    /// A rejected draft leaves the recurrent states past the accepted tokens, so the main model
+    /// returns to its snapshot and runs the accepted tokens again.
+    pub fn generate_mtp(
+        &mut self,
+        prompt: &Tensor,
+        max_new: usize,
+        drafts: usize,
+        mut on_token: impl FnMut(u32) -> Result<bool>,
+    ) -> Result<MtpStats> {
+        if drafts == 0 {
+            candle::bail!("generate_mtp needs at least one draft per round")
+        }
+        let argmax = |logits: &Tensor| -> Result<Vec<u32>> {
+            logits.squeeze(0)?.argmax(D::Minus1)?.to_vec1::<u32>()
+        };
+        let dev = self.device.clone();
+        let p = prompt.dim(1)?;
+        let mut stats = MtpStats::default();
+        if max_new == 0 {
+            return Ok(stats);
+        }
+        self.clear_kv_cache();
+        let hidden = self.forward_hidden(prompt, 0)?;
+        let mut next = argmax(&self.logits(&hidden.narrow(1, p - 1, 1)?)?)?[0];
+        let mut generated = 1;
+        if !on_token(next)? || generated == max_new {
+            return Ok(stats);
+        }
+        // The MTP pairs yet to enter its cache: each token with the hidden state before it.
+        let mut pending_ids = Tensor::cat(
+            &[prompt.narrow(1, 1, p - 1)?, Tensor::new(&[[next]], &dev)?],
+            1,
+        )?;
+        let mut pending_hidden = hidden;
+        let (mut pos, mut mtp_pos) = (p, 0);
+        loop {
+            // Draft. The pending pairs hold the main model's hidden states and are kept; the
+            // chained drafts are dropped after verification.
+            let n = pending_ids.dim(1)?;
+            let g = self.mtp_forward_hidden(&pending_ids, &pending_hidden, mtp_pos, 0)?;
+            mtp_pos += n;
+            let committed = self.cache();
+            let mut g = g.narrow(1, n - 1, 1)?;
+            let mut draft = vec![argmax(&self.logits(&g)?)?[0]];
+            for step in 1..drafts {
+                let ids = Tensor::new(&[[draft[step - 1]]], &dev)?;
+                g = self.mtp_forward_hidden(&ids, &g, mtp_pos + step - 1, step)?;
+                draft.push(argmax(&self.logits(&g)?)?[0]);
+            }
+            stats.drafted += drafts;
+            stats.rounds += 1;
+
+            // Verify every draft in one pass.
+            let mut input = vec![next];
+            input.extend(&draft);
+            let ids = Tensor::new(input.as_slice(), &dev)?.unsqueeze(0)?;
+            let h = self.forward_hidden(&ids, pos)?;
+            let target = argmax(&self.logits(&h)?)?;
+            let accepted = draft
+                .iter()
+                .zip(&target)
+                .take_while(|(d, t)| d == t)
+                .count();
+            stats.accepted += accepted;
+            let mut tokens = draft[..accepted].to_vec();
+            tokens.push(target[accepted]);
+            for &t in tokens.iter() {
+                generated += 1;
+                if !on_token(t)? || generated == max_new {
+                    return Ok(stats);
+                }
+            }
+
+            let h = if accepted < drafts {
+                // Back to the state before verification, then through the accepted tokens.
+                self.set_cache(committed)?;
+                let ids = Tensor::new(&input[..accepted + 1], &dev)?.unsqueeze(0)?;
+                self.forward_hidden(&ids, pos)?
+            } else {
+                let mut cache = committed;
+                cache.layers = self.cache().layers;
+                self.set_cache(cache)?;
+                h
+            };
+            pending_ids = Tensor::new(tokens.as_slice(), &dev)?.unsqueeze(0)?;
+            pending_hidden = h.narrow(1, 0, accepted + 1)?;
+            pos += accepted + 1;
+            next = target[accepted];
         }
     }
 }

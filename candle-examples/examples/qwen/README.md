@@ -59,8 +59,7 @@ cargo run --example qwen --features cuda --release  -- --prompt "Write a poem ab
 
 The dense Qwen3.5 and Qwen3.8 checkpoints use a hybrid architecture: three layers out of four
 use Gated DeltaNet, a linear-attention recurrence with a fixed-size state, and the others use
-gated full attention. Only the text model is supported; the vision tower and the
-multi-token-prediction weights of these checkpoints are not loaded.
+gated full attention. Only the text model is supported; the vision tower is not loaded.
 
 ```bash
 $ cargo run --example qwen --features cuda --release -- --model 3.8-27b --prompt "Explain the delta rule."
@@ -69,6 +68,15 @@ $ cargo run --example qwen --features cuda --release -- --model 3.8-27b --prompt
 The 27B models need about 54GB of GPU memory in bf16. As for Qwen3, the prompt is wrapped in the
 chat template unless `--no-chat-template` is passed, and `--thinking` lets the model reason before
 answering.
+
+The checkpoints also carry a multi-token-prediction (MTP) head, which `--mtp-drafts N` uses for
+speculative decoding: the head drafts `N` tokens, and one pass of the model checks them all and
+keeps those it agrees with. The output is that of greedy decoding, without repeat penalty, in
+fewer model passes.
+
+```bash
+$ cargo run --example qwen --features cuda --release -- --model 3.8-27b --mtp-drafts 2 --prompt "Explain the delta rule."
+```
 
 ## Qwen3.8-Flash-Next
 
