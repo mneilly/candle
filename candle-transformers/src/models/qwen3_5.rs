@@ -431,7 +431,7 @@ fn l2norm(xs: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// `log(1 + exp(x))`, computed without overflow.
-fn softplus(xs: &Tensor) -> Result<Tensor> {
+pub(crate) fn softplus(xs: &Tensor) -> Result<Tensor> {
     let tail = ((xs.abs()?.neg()?.exp()? + 1.)?).log()?;
     xs.relu()? + tail
 }
@@ -1031,100 +1031,189 @@ impl Model {
         mtp.norm.forward(&xs)
     }
 
-    /// Greedy decoding of a `(1, seq)` prompt with the MTP head drafting `drafts` tokens per
-    /// main-model pass, which verifies them all at once. The tokens are those of plain greedy
-    /// decoding, up to rounding. Starts from cleared caches; `on_token` receives each new token
-    /// and returns whether to go on, and generation stops after `max_new` tokens.
-    ///
-    /// A rejected draft leaves the recurrent states past the accepted tokens, so the main model
-    /// returns to its snapshot and runs the accepted tokens again.
+    /// Greedy decoding with the MTP head drafting `drafts` tokens per main-model pass; see
+    /// [`generate_mtp`].
     pub fn generate_mtp(
         &mut self,
         prompt: &Tensor,
         max_new: usize,
         drafts: usize,
-        mut on_token: impl FnMut(u32) -> Result<bool>,
+        on_token: impl FnMut(u32) -> Result<bool>,
     ) -> Result<MtpStats> {
-        if drafts == 0 {
-            candle::bail!("generate_mtp needs at least one draft per round")
-        }
-        let argmax = |logits: &Tensor| -> Result<Vec<u32>> {
-            logits.squeeze(0)?.argmax(D::Minus1)?.to_vec1::<u32>()
+        generate_mtp(self, prompt, max_new, drafts, on_token)
+    }
+}
+
+impl MtpModel for Model {
+    type Cache = Cache;
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn clear_kv_cache(&mut self) {
+        Model::clear_kv_cache(self)
+    }
+
+    fn forward_hidden(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        Model::forward_hidden(self, input, offset)
+    }
+
+    fn logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        Model::logits(self, hidden)
+    }
+
+    fn mtp_forward_hidden(
+        &mut self,
+        ids: &Tensor,
+        hidden: &Tensor,
+        offset: usize,
+        step: usize,
+    ) -> Result<Tensor> {
+        Model::mtp_forward_hidden(self, ids, hidden, offset, step)
+    }
+
+    fn cache(&self) -> Cache {
+        Model::cache(self)
+    }
+
+    fn set_cache(&mut self, cache: Cache) -> Result<()> {
+        Model::set_cache(self, cache)
+    }
+
+    fn set_mtp_cache(&mut self, cache: Cache) -> Result<()> {
+        let cache = Cache {
+            layers: Model::cache(self).layers,
+            mtp_layers: cache.mtp_layers,
         };
-        let dev = self.device.clone();
-        let p = prompt.dim(1)?;
-        let mut stats = MtpStats::default();
-        if max_new == 0 {
-            return Ok(stats);
-        }
-        self.clear_kv_cache();
-        let hidden = self.forward_hidden(prompt, 0)?;
-        let mut next = argmax(&self.logits(&hidden.narrow(1, p - 1, 1)?)?)?[0];
-        let mut generated = 1;
-        if !on_token(next)? || generated == max_new {
-            return Ok(stats);
-        }
-        // The MTP pairs yet to enter its cache: each token with the hidden state before it.
-        let mut pending_ids = Tensor::cat(
-            &[prompt.narrow(1, 1, p - 1)?, Tensor::new(&[[next]], &dev)?],
-            1,
-        )?;
-        let mut pending_hidden = hidden;
-        let (mut pos, mut mtp_pos) = (p, 0);
-        loop {
-            // Draft. The pending pairs hold the main model's hidden states and are kept; the
-            // chained drafts are dropped after verification.
-            let n = pending_ids.dim(1)?;
-            let g = self.mtp_forward_hidden(&pending_ids, &pending_hidden, mtp_pos, 0)?;
-            mtp_pos += n;
-            let committed = self.cache();
-            let mut g = g.narrow(1, n - 1, 1)?;
-            let mut draft = vec![argmax(&self.logits(&g)?)?[0]];
-            for step in 1..drafts {
-                let ids = Tensor::new(&[[draft[step - 1]]], &dev)?;
-                g = self.mtp_forward_hidden(&ids, &g, mtp_pos + step - 1, step)?;
-                draft.push(argmax(&self.logits(&g)?)?[0]);
-            }
-            stats.drafted += drafts;
-            stats.rounds += 1;
+        Model::set_cache(self, cache)
+    }
+}
 
-            // Verify every draft in one pass.
-            let mut input = vec![next];
-            input.extend(&draft);
-            let ids = Tensor::new(input.as_slice(), &dev)?.unsqueeze(0)?;
-            let h = self.forward_hidden(&ids, pos)?;
-            let target = argmax(&self.logits(&h)?)?;
-            let accepted = draft
-                .iter()
-                .zip(&target)
-                .take_while(|(d, t)| d == t)
-                .count();
-            stats.accepted += accepted;
-            let mut tokens = draft[..accepted].to_vec();
-            tokens.push(target[accepted]);
-            for &t in tokens.iter() {
-                generated += 1;
-                if !on_token(t)? || generated == max_new {
-                    return Ok(stats);
-                }
-            }
+/// A model with an MTP head, for [`generate_mtp`].
+pub trait MtpModel {
+    /// A snapshot of every cache, MTP layers included.
+    type Cache;
 
-            let h = if accepted < drafts {
-                // Back to the state before verification, then through the accepted tokens.
-                self.set_cache(committed)?;
-                let ids = Tensor::new(&input[..accepted + 1], &dev)?.unsqueeze(0)?;
-                self.forward_hidden(&ids, pos)?
-            } else {
-                let mut cache = committed;
-                cache.layers = self.cache().layers;
-                self.set_cache(cache)?;
-                h
-            };
-            pending_ids = Tensor::new(tokens.as_slice(), &dev)?.unsqueeze(0)?;
-            pending_hidden = h.narrow(1, 0, accepted + 1)?;
-            pos += accepted + 1;
-            next = target[accepted];
+    fn device(&self) -> &Device;
+    fn clear_kv_cache(&mut self);
+    /// The `(batch, seq, hidden)` normed hidden states of `input` after `offset` tokens.
+    fn forward_hidden(&mut self, input: &Tensor, offset: usize) -> Result<Tensor>;
+    /// The LM head applied to normed hidden states.
+    fn logits(&self, hidden: &Tensor) -> Result<Tensor>;
+    /// The normed outputs of the MTP head for `ids`, each paired with the hidden state of the
+    /// position before it, at MTP cache positions from `offset`.
+    fn mtp_forward_hidden(
+        &mut self,
+        ids: &Tensor,
+        hidden: &Tensor,
+        offset: usize,
+        step: usize,
+    ) -> Result<Tensor>;
+    /// The token drafted from the `(1, 1, hidden)` output of an MTP step.
+    fn draft_token(&self, hidden: &Tensor) -> Result<u32> {
+        self.logits(hidden)?
+            .flatten_all()?
+            .argmax(0)?
+            .to_scalar::<u32>()
+    }
+    fn cache(&self) -> Self::Cache;
+    fn set_cache(&mut self, cache: Self::Cache) -> Result<()>;
+    /// Returns the MTP layers alone to a snapshot, keeping the main model's caches.
+    fn set_mtp_cache(&mut self, cache: Self::Cache) -> Result<()>;
+}
+
+/// Greedy decoding of a `(1, seq)` prompt with the MTP head drafting `drafts` tokens per
+/// main-model pass, which verifies them all at once. The tokens are those of plain greedy
+/// decoding, up to rounding. Starts from cleared caches; `on_token` receives each new token
+/// and returns whether to go on, and generation stops after `max_new` tokens.
+///
+/// A rejected draft leaves the recurrent states past the accepted tokens, so the main model
+/// returns to its snapshot and runs the accepted tokens again.
+pub fn generate_mtp<M: MtpModel>(
+    model: &mut M,
+    prompt: &Tensor,
+    max_new: usize,
+    drafts: usize,
+    mut on_token: impl FnMut(u32) -> Result<bool>,
+) -> Result<MtpStats> {
+    if drafts == 0 {
+        candle::bail!("generate_mtp needs at least one draft per round")
+    }
+    let argmax = |logits: &Tensor| -> Result<Vec<u32>> {
+        logits.squeeze(0)?.argmax(D::Minus1)?.to_vec1::<u32>()
+    };
+    let dev = model.device().clone();
+    let p = prompt.dim(1)?;
+    let mut stats = MtpStats::default();
+    if max_new == 0 {
+        return Ok(stats);
+    }
+    model.clear_kv_cache();
+    let hidden = model.forward_hidden(prompt, 0)?;
+    let mut next = argmax(&model.logits(&hidden.narrow(1, p - 1, 1)?)?)?[0];
+    let mut generated = 1;
+    if !on_token(next)? || generated == max_new {
+        return Ok(stats);
+    }
+    // The MTP pairs yet to enter its cache: each token with the hidden state before it.
+    let mut pending_ids = Tensor::cat(
+        &[prompt.narrow(1, 1, p - 1)?, Tensor::new(&[[next]], &dev)?],
+        1,
+    )?;
+    let mut pending_hidden = hidden;
+    let (mut pos, mut mtp_pos) = (p, 0);
+    loop {
+        // Draft. The pending pairs hold the main model's hidden states and are kept; the
+        // chained drafts are dropped after verification.
+        let n = pending_ids.dim(1)?;
+        let g = model.mtp_forward_hidden(&pending_ids, &pending_hidden, mtp_pos, 0)?;
+        mtp_pos += n;
+        let committed = model.cache();
+        let mut g = g.narrow(1, n - 1, 1)?;
+        let mut draft = vec![model.draft_token(&g)?];
+        for step in 1..drafts {
+            let ids = Tensor::new(&[[draft[step - 1]]], &dev)?;
+            g = model.mtp_forward_hidden(&ids, &g, mtp_pos + step - 1, step)?;
+            draft.push(model.draft_token(&g)?);
         }
+        stats.drafted += drafts;
+        stats.rounds += 1;
+
+        // Verify every draft in one pass.
+        let mut input = vec![next];
+        input.extend(&draft);
+        let ids = Tensor::new(input.as_slice(), &dev)?.unsqueeze(0)?;
+        let h = model.forward_hidden(&ids, pos)?;
+        let target = argmax(&model.logits(&h)?)?;
+        let accepted = draft
+            .iter()
+            .zip(&target)
+            .take_while(|(d, t)| d == t)
+            .count();
+        stats.accepted += accepted;
+        let mut tokens = draft[..accepted].to_vec();
+        tokens.push(target[accepted]);
+        for &t in tokens.iter() {
+            generated += 1;
+            if !on_token(t)? || generated == max_new {
+                return Ok(stats);
+            }
+        }
+
+        let h = if accepted < drafts {
+            // Back to the state before verification, then through the accepted tokens.
+            model.set_cache(committed)?;
+            let ids = Tensor::new(&input[..accepted + 1], &dev)?.unsqueeze(0)?;
+            model.forward_hidden(&ids, pos)?
+        } else {
+            model.set_mtp_cache(committed)?;
+            h
+        };
+        pending_ids = Tensor::new(tokens.as_slice(), &dev)?.unsqueeze(0)?;
+        pending_hidden = h.narrow(1, 0, accepted + 1)?;
+        pos += accepted + 1;
+        next = target[accepted];
     }
 }
 
