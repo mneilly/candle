@@ -266,6 +266,12 @@ impl RotaryEmbedding {
         })
     }
 
+    /// Sets the frequency sections of multimodal RoPE, see [`RopeParameters::mrope_section`].
+    pub(crate) fn with_mrope_section(mut self, section: Option<Vec<usize>>) -> Self {
+        self.mrope_section = section;
+        self
+    }
+
     /// The `(seq, rotary_dim / 2)` cos and sin of `seq` positions from `start`.
     pub(crate) fn cos_sin(&self, start: usize, seq: usize) -> Result<(Tensor, Tensor)> {
         Ok((

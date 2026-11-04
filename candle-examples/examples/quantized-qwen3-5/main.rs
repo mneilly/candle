@@ -15,6 +15,7 @@ use candle::{Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::quantized_qwen3_5::{Config, L2Norm, Model};
+use candle_transformers::models::qwen3_5_vl::{smart_resize, Images, VisionModel};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum L2NormArg {
@@ -38,6 +39,19 @@ struct Args {
     /// The GGUF file of `--repo` to run.
     #[arg(long)]
     file: Option<String>,
+
+    /// The `mmproj` GGUF file of the vision tower, local or in `--repo`; it is read only with
+    /// `--image`.
+    #[arg(long)]
+    mmproj: Option<String>,
+
+    /// Images for the prompt, which need `--mmproj`.
+    #[arg(long)]
+    image: Vec<String>,
+
+    /// The largest number of pixels an image is resized to.
+    #[arg(long, default_value_t = 28 * 28 * 1280)]
+    max_image_pixels: usize,
 
     /// A `tokenizer.json`; by default the tokenizer stored in the GGUF file is used.
     #[arg(long)]
@@ -122,13 +136,57 @@ fn main() -> Result<()> {
         start.elapsed().as_secs_f32()
     );
 
+    // The vision tower is loaded only for images.
+    let mut images = None;
+    let mut placeholders = String::new();
+    if !args.image.is_empty() {
+        let Some(mmproj) = &args.mmproj else {
+            anyhow::bail!("--image needs --mmproj")
+        };
+        let path = if std::path::Path::new(mmproj).exists() {
+            std::path::PathBuf::from(mmproj)
+        } else {
+            candle_examples::hub::Api::new()?
+                .model(args.repo.clone())
+                .get(mmproj)?
+        };
+        let mut f = std::fs::File::open(&path)?;
+        let ct = gguf_file::Content::read(&mut f).map_err(|e| e.with_path(&path))?;
+        let (vision, processor) = VisionModel::from_mmproj(&ct, &mut f, &device)?;
+        let (mut pixels, mut grids) = (vec![], vec![]);
+        for path in args.image.iter() {
+            let img = image::ImageReader::open(path)?.decode()?.to_rgb8();
+            let f = processor.factor();
+            let (h, w) = smart_resize(
+                img.height() as usize,
+                img.width() as usize,
+                f,
+                f * f,
+                args.max_image_pixels,
+            )?;
+            let img = image::imageops::resize(
+                &img,
+                w as u32,
+                h as u32,
+                image::imageops::FilterType::CatmullRom,
+            );
+            let img = Tensor::from_vec(img.into_raw(), (h, w, 3), &Device::Cpu)?;
+            let (p, grid) = processor.preprocess(&img)?;
+            let n = grid.0 * grid.1 * grid.2 / processor.merge_size.pow(2);
+            placeholders.push_str(&format!(
+                "<|vision_start|>{}<|vision_end|>",
+                "<|image_pad|>".repeat(n)
+            ));
+            pixels.push(p.to_device(&device)?);
+            grids.push(grid);
+        }
+        images = Some((vision, Tensor::cat(&pixels, 0)?, grids));
+    }
+    let user = format!("{placeholders}{}", args.prompt);
     let prompt = if args.no_chat_template {
-        args.prompt.clone()
+        user
     } else {
-        format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            args.prompt
-        )
+        format!("<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n")
     };
     let ids = tokenizer.encode(prompt, true).map_err(E::msg)?;
     let ids = ids.get_ids().to_vec();
@@ -136,12 +194,17 @@ fn main() -> Result<()> {
         .iter()
         .filter_map(|t| tokenizer.token_to_id(t))
         .collect();
+    let tokenizer_image_token = tokenizer.token_to_id("<|image_pad|>").unwrap_or(0);
+    if images.is_some() && tokenizer.token_to_id("<|image_pad|>").is_none() {
+        anyhow::bail!("the tokenizer has no <|image_pad|> token")
+    }
     let mut tos = TokenOutputStream::new(tokenizer);
     let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
     let mut generated = 0usize;
     let start = std::time::Instant::now();
 
     match args.mtp_drafts {
+        Some(_) if images.is_some() => anyhow::bail!("--mtp-drafts does not take images yet"),
         Some(drafts) => {
             if !model.has_mtp() {
                 anyhow::bail!("the file has no MTP layers")
@@ -180,7 +243,19 @@ fn main() -> Result<()> {
                 }
             };
             let mut sampler = LogitsProcessor::from_sampling(args.seed, sampling);
-            let mut logits = model.forward(&input, 0)?;
+            let mut logits = match &images {
+                Some((vision, pixel_values, grids)) => {
+                    let image_token = tokenizer_image_token;
+                    let images = Images {
+                        pixel_values,
+                        grids,
+                    };
+                    let h =
+                        model.forward_prompt_hidden(&input, Some((vision, images)), image_token)?;
+                    model.logits(&h.narrow(1, ids.len() - 1, 1)?)?
+                }
+                None => model.forward(&input, 0)?,
+            };
             for index in 0..args.sample_len {
                 let t = sampler.sample(&logits.flatten_all()?)?;
                 generated += 1;

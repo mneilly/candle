@@ -8,419 +8,14 @@
 mod common;
 
 use candle::quantized::gguf_file::{self, Value};
-use candle::quantized::{GgmlDType, QTensor};
+use candle::quantized::GgmlDType;
 use candle::{DType, Device, Tensor};
 use candle_transformers::models::quantized_qwen3_5::{Config, L2Norm, Model};
 use candle_transformers::models::qwen3_5::{self, MtpModel};
-use common::{assert_close, load, read};
+use common::qwen35_gguf::*;
+use common::{assert_close, load};
 use std::collections::HashMap;
 use std::io::Cursor;
-
-/// A Hadamard fold: every 2D weight except the GDN projections to the value heads, the token
-/// table rotated for lookups, and with `tied` the output head bound to it (version 2).
-#[derive(Clone, Copy)]
-struct Fold {
-    block: usize,
-    signs: bool,
-    tied: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct Opts {
-    fold: Option<Fold>,
-    fused_qkv: bool,
-    /// Halve `ffn_down` and `attn_output`, with a scale of 2.
-    scales: bool,
-    /// A draft head over every other token.
-    draft_head: bool,
-    /// MTP layers with their own copies of the token table and LM head.
-    mtp_own_head: bool,
-    dtype: Option<GgmlDType>,
-}
-
-struct Hf {
-    t: HashMap<String, Tensor>,
-    cfg: qwen3_5::Config,
-    /// The prefix of the trunk weights, `model.` or `model.language_model.`.
-    prefix: String,
-}
-
-impl Hf {
-    fn fixture(variant: &str) -> Self {
-        let cfg =
-            qwen3_5::Config::from_json(&read(&format!("qwen3_5/{variant}/config.json"))).unwrap();
-        let t = load(&format!("qwen3_5/{variant}/model.safetensors")).unwrap();
-        let prefix = if t.contains_key("model.language_model.embed_tokens.weight") {
-            "model.language_model."
-        } else {
-            "model."
-        };
-        Self {
-            t,
-            cfg,
-            prefix: prefix.to_string(),
-        }
-    }
-
-    fn get(&self, name: &str) -> Tensor {
-        match self.t.get(&format!("{}{name}", self.prefix)) {
-            Some(t) => t.clone(),
-            None => self.t[name].clone(),
-        }
-    }
-}
-
-/// Grouped value heads `g * rep + r` to tiled `r * n_k + g` along `dim`.
-fn tile(t: &Tensor, dim: usize, nk: usize, rep: usize, hd: usize) -> Tensor {
-    let mut shape = t.dims().to_vec();
-    let mut split = shape.clone();
-    split.splice(dim..dim + 1, [nk, rep, hd]);
-    let t = t.reshape(split).unwrap().transpose(dim, dim + 1).unwrap();
-    shape[dim] = nk * rep * hd;
-    t.contiguous().unwrap().reshape(shape).unwrap()
-}
-
-/// `H[i, j] = (-1)^popcount(i & j) / sqrt(n)`.
-fn hadamard(n: usize) -> Tensor {
-    let s = 1. / (n as f32).sqrt();
-    let h: Vec<f32> = (0..n * n)
-        .map(|k| {
-            if ((k / n) & (k % n)).count_ones() % 2 == 1 {
-                -s
-            } else {
-                s
-            }
-        })
-        .collect();
-    Tensor::from_vec(h, (n, n), &Device::Cpu).unwrap()
-}
-
-/// Signs from a fixed pattern, one per input feature.
-fn signs(n: usize) -> Vec<i32> {
-    (0..n)
-        .map(|i| if (i * 7 + i / 3) % 5 < 2 { -1 } else { 1 })
-        .collect()
-}
-
-/// `W D H`: the signs then the block rotation on the input dimension.
-fn fold_weight(w: &Tensor, f: Fold) -> Tensor {
-    let (o, i) = w.dims2().unwrap();
-    let mut w = w.clone();
-    if f.signs {
-        let s: Vec<f32> = signs(i).iter().map(|&s| s as f32).collect();
-        w = w
-            .broadcast_mul(&Tensor::new(s, &Device::Cpu).unwrap())
-            .unwrap();
-    }
-    w.reshape((o * i / f.block, f.block))
-        .unwrap()
-        .matmul(&hadamard(f.block))
-        .unwrap()
-        .reshape((o, i))
-        .unwrap()
-}
-
-fn u32v(v: usize) -> Value {
-    Value::U32(v as u32)
-}
-
-/// Writes the GGUF file of a Qwen3.5 checkpoint.
-fn convert(hf: &Hf, opts: Opts) -> Vec<u8> {
-    let cfg = &hf.cfg;
-    let (nk, nv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads);
-    let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
-    let rep = nv / nk;
-    let n_mtp = if hf.t.contains_key("mtp.fc.weight") {
-        cfg.mtp_num_hidden_layers
-    } else {
-        0
-    };
-    let mut ts: Vec<(String, Tensor)> = vec![];
-    let plus1 = |t: Tensor| (t + 1.).unwrap();
-    let layer = |ts: &mut Vec<(String, Tensor)>, hp: &str, gp: &str, full: bool| {
-        let g = |n: &str| hf.get(&format!("{hp}.{n}"));
-        let mut put = |n: &str, t: Tensor| ts.push((format!("{gp}.{n}"), t));
-        put("attn_norm.weight", plus1(g("input_layernorm.weight")));
-        put(
-            "post_attention_norm.weight",
-            plus1(g("post_attention_layernorm.weight")),
-        );
-        for (h, n) in [
-            ("gate_proj", "ffn_gate"),
-            ("up_proj", "ffn_up"),
-            ("down_proj", "ffn_down"),
-        ] {
-            put(&format!("{n}.weight"), g(&format!("mlp.{h}.weight")));
-        }
-        if full {
-            let (q, k, v) = (
-                g("self_attn.q_proj.weight"),
-                g("self_attn.k_proj.weight"),
-                g("self_attn.v_proj.weight"),
-            );
-            if opts.fused_qkv {
-                put("attn_qkv.weight", Tensor::cat(&[q, k, v], 0).unwrap());
-            } else {
-                put("attn_q.weight", q);
-                put("attn_k.weight", k);
-                put("attn_v.weight", v);
-            }
-            put("attn_output.weight", g("self_attn.o_proj.weight"));
-            put("attn_q_norm.weight", plus1(g("self_attn.q_norm.weight")));
-            put("attn_k_norm.weight", plus1(g("self_attn.k_norm.weight")));
-        } else {
-            let qkv = g("linear_attn.in_proj_qkv.weight");
-            let v = tile(
-                &qkv.narrow(0, 2 * nk * dk, nv * dv).unwrap(),
-                0,
-                nk,
-                rep,
-                dv,
-            );
-            let qkv = Tensor::cat(&[qkv.narrow(0, 0, 2 * nk * dk).unwrap(), v], 0).unwrap();
-            put("attn_qkv.weight", qkv);
-            put(
-                "attn_gate.weight",
-                tile(&g("linear_attn.in_proj_z.weight"), 0, nk, rep, dv),
-            );
-            put(
-                "ssm_beta.weight",
-                tile(&g("linear_attn.in_proj_b.weight"), 0, nk, rep, 1),
-            );
-            put(
-                "ssm_alpha.weight",
-                tile(&g("linear_attn.in_proj_a.weight"), 0, nk, rep, 1),
-            );
-            let a = g("linear_attn.A_log").exp().unwrap().neg().unwrap();
-            put(
-                "ssm_a",
-                tile(&a.unsqueeze(1).unwrap(), 0, nk, rep, 1)
-                    .flatten_all()
-                    .unwrap(),
-            );
-            let dt = g("linear_attn.dt_bias").unsqueeze(1).unwrap();
-            put(
-                "ssm_dt.bias",
-                tile(&dt, 0, nk, rep, 1).flatten_all().unwrap(),
-            );
-            let conv = g("linear_attn.conv1d.weight").squeeze(1).unwrap();
-            let cv = tile(
-                &conv.narrow(0, 2 * nk * dk, nv * dv).unwrap(),
-                0,
-                nk,
-                rep,
-                dv,
-            );
-            let conv = Tensor::cat(&[conv.narrow(0, 0, 2 * nk * dk).unwrap(), cv], 0).unwrap();
-            put("ssm_conv1d.weight", conv);
-            put("ssm_norm.weight", g("linear_attn.norm.weight"));
-            let out = g("linear_attn.out_proj.weight");
-            // A folded output projection keeps the grouped order, the runtime permutes instead.
-            let out = if opts.fold.is_some() {
-                out
-            } else {
-                tile(&out, 1, nk, rep, dv)
-            };
-            put("ssm_out.weight", out);
-        }
-    };
-    let types = cfg.layer_types();
-    for (i, t) in types.iter().enumerate() {
-        let full = *t == qwen3_5::LayerType::FullAttention;
-        layer(&mut ts, &format!("layers.{i}"), &format!("blk.{i}"), full);
-    }
-    let n = cfg.num_hidden_layers;
-    for i in 0..n_mtp {
-        let gp = format!("blk.{}", n + i);
-        layer(&mut ts, &format!("mtp.layers.{i}"), &gp, true);
-        ts.push((
-            format!("{gp}.nextn.eh_proj.weight"),
-            hf.t["mtp.fc.weight"].clone(),
-        ));
-        for (h, g) in [
-            ("pre_fc_norm_embedding", "enorm"),
-            ("pre_fc_norm_hidden", "hnorm"),
-            ("norm", "shared_head_norm"),
-        ] {
-            let w = plus1(hf.t[&format!("mtp.{h}.weight")].clone());
-            ts.push((format!("{gp}.nextn.{g}.weight"), w));
-        }
-        if opts.mtp_own_head {
-            let n = |s: &str| format!("{gp}.nextn.{s}.weight");
-            ts.push((n("embed_tokens"), hf.get("embed_tokens.weight")));
-            ts.push((n("shared_head_head"), hf.t["lm_head.weight"].clone()));
-        }
-        if opts.draft_head && i == 0 {
-            let lm = hf.t["lm_head.weight"].clone();
-            let ids: Vec<u32> = (0..cfg.vocab_size as u32).step_by(2).collect();
-            let idx = Tensor::new(ids.as_slice(), &Device::Cpu).unwrap();
-            ts.push((
-                format!("{gp}.nextn.draft_head.weight"),
-                lm.index_select(&idx, 0).unwrap(),
-            ));
-            let ids: Vec<f32> = ids.iter().map(|&i| i as f32).collect();
-            ts.push((
-                format!("{gp}.nextn.draft_head_ids.weight"),
-                Tensor::new(ids, &Device::Cpu).unwrap(),
-            ));
-        }
-    }
-    ts.push(("token_embd.weight".into(), hf.get("embed_tokens.weight")));
-    ts.push(("output_norm.weight".into(), plus1(hf.get("norm.weight"))));
-    let tied = cfg.tie_word_embeddings;
-    if !tied {
-        ts.push(("output.weight".into(), hf.t["lm_head.weight"].clone()));
-    }
-
-    let mut md: Vec<(String, Value)> = vec![];
-    let mut kv = |k: &str, v: Value| md.push((format!("qwen35.{k}"), v));
-    kv("block_count", u32v(n + n_mtp));
-    if n_mtp > 0 {
-        kv("nextn_predict_layers", u32v(n_mtp));
-    }
-    kv("embedding_length", u32v(cfg.hidden_size));
-    kv("feed_forward_length", u32v(cfg.intermediate_size));
-    kv("attention.head_count", u32v(cfg.num_attention_heads));
-    kv("attention.head_count_kv", u32v(cfg.num_key_value_heads));
-    kv("attention.key_length", u32v(cfg.head_dim));
-    kv("attention.value_length", u32v(cfg.head_dim));
-    kv(
-        "attention.layer_norm_rms_epsilon",
-        Value::F32(cfg.rms_norm_eps as f32),
-    );
-    let theta = cfg.rope_parameters.as_ref().and_then(|r| r.rope_theta);
-    kv(
-        "rope.freq_base",
-        Value::F32(theta.or(cfg.rope_theta).unwrap() as f32),
-    );
-    let factor = cfg
-        .rope_parameters
-        .as_ref()
-        .and_then(|r| r.partial_rotary_factor)
-        .or(cfg.partial_rotary_factor)
-        .unwrap();
-    kv(
-        "rope.dimension_count",
-        u32v((cfg.head_dim as f64 * factor) as usize),
-    );
-    kv("context_length", u32v(cfg.max_position_embeddings));
-    kv("ssm.conv_kernel", u32v(cfg.linear_conv_kernel_dim));
-    kv("ssm.inner_size", u32v(nv * dv));
-    kv("ssm.state_size", u32v(dk));
-    kv("ssm.time_step_rank", u32v(nv));
-    kv("ssm.group_count", u32v(nk));
-    let recurrent: Vec<Value> = types
-        .iter()
-        .map(|t| Value::Bool(*t == qwen3_5::LayerType::LinearAttention))
-        .chain((0..n_mtp).map(|_| Value::Bool(false)))
-        .collect();
-    kv("attention.recurrent_layers", Value::Array(recurrent));
-    md.push((
-        "general.architecture".into(),
-        Value::String("qwen35".into()),
-    ));
-
-    if let Some(f) = opts.fold {
-        // Fold every 2D matmul weight but the token table, then rotate the token table.
-        let is_folded = |n: &str| {
-            let kinds = [
-                "attn_q",
-                "attn_k",
-                "attn_v",
-                "attn_qkv",
-                "attn_gate",
-                "attn_output",
-                "ffn_gate",
-                "ffn_up",
-                "ffn_down",
-                "ssm_out",
-            ];
-            n == "output.weight" || kinds.iter().any(|k| n.ends_with(&format!(".{k}.weight")))
-        };
-        let mut names = vec![];
-        let mut widths = std::collections::BTreeSet::new();
-        for (n, t) in ts.iter_mut() {
-            if is_folded(n) {
-                widths.insert(t.dim(1).unwrap());
-                *t = fold_weight(t, f);
-                names.push(Value::String(n.clone()));
-            }
-        }
-        for (n, t) in ts.iter_mut() {
-            if n == "token_embd.weight" {
-                widths.insert(t.dim(1).unwrap());
-                *t = fold_weight(t, f);
-            }
-        }
-        let p = |k: &str| format!("prism.hadamard.{k}");
-        md.push((p("version"), u32v(if f.tied { 2 } else { 1 })));
-        md.push((p("tied_output"), Value::Bool(f.tied)));
-        md.push((p("block_size"), u32v(f.block)));
-        let transform = "normalized-sylvester-walsh-hadamard";
-        md.push((p("transform"), Value::String(transform.into())));
-        md.push((p("axis"), Value::String("input-last-dimension".into())));
-        let mode = if f.signs { "explicit" } else { "identity" };
-        md.push((p("sign_mode"), Value::String(mode.into())));
-        if f.signs {
-            let ws: Vec<Value> = widths.iter().map(|&w| Value::I32(w as i32)).collect();
-            let vs: Vec<Value> = widths
-                .iter()
-                .flat_map(|&w| signs(w))
-                .map(Value::I32)
-                .collect();
-            md.push((p("sign_widths"), Value::Array(ws)));
-            md.push((p("sign_values"), Value::Array(vs)));
-        }
-        md.push((p("weight_names"), Value::Array(names)));
-        let inverse = vec![Value::String("token_embd.weight".into())];
-        md.push((p("inverse_weight_names"), Value::Array(inverse)));
-        md.push((p("gdn_v_grouped"), Value::Bool(true)));
-    }
-    if opts.scales {
-        let mut extra = vec![];
-        for (n, t) in ts.iter_mut() {
-            if n.ends_with(".ffn_down.weight") || n.ends_with(".attn_output.weight") {
-                *t = (t.clone() / 2.).unwrap();
-                let base = n.trim_end_matches(".weight");
-                extra.push((
-                    format!("{base}.scale"),
-                    Tensor::new(&[2f32], &Device::Cpu).unwrap(),
-                ));
-            }
-        }
-        ts.extend(extra);
-    }
-
-    let qs: Vec<(String, QTensor)> = ts
-        .into_iter()
-        .map(|(n, t)| {
-            let dtype = match opts.dtype {
-                Some(d) if t.rank() == 2 && !n.contains("conv1d") => d,
-                _ => GgmlDType::F32,
-            };
-            (n, QTensor::quantize(&t, dtype).unwrap())
-        })
-        .collect();
-    let mdr: Vec<(&str, &Value)> = md.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let tsr: Vec<(&str, &QTensor)> = qs.iter().map(|(n, t)| (n.as_str(), t)).collect();
-    let mut buf = Cursor::new(Vec::new());
-    gguf_file::write(&mut buf, &mdr, &tsr).unwrap();
-    buf.into_inner()
-}
-
-/// The model with transformers' query-key norm, to compare with its references.
-fn model(bytes: Vec<u8>) -> Model {
-    model_with(bytes, L2Norm::Sqrt)
-}
-
-fn model_with(bytes: Vec<u8>, l2_norm: L2Norm) -> Model {
-    let mut r = Cursor::new(bytes);
-    let ct = gguf_file::Content::read(&mut r).unwrap();
-    let mut cfg = Config::from_gguf(&ct).unwrap();
-    assert_eq!(cfg.l2_norm, L2Norm::Max);
-    cfg.l2_norm = l2_norm;
-    Model::new(&cfg, &ct, &mut r, &Device::Cpu).unwrap()
-}
 
 /// Prefill, cached decode steps and a continuation against the transformers references.
 fn check_logits(model: &mut Model, variant: &str, tol: f32) {
@@ -1017,4 +612,82 @@ fn invalid_hadamard_metadata() {
             .to_string();
         assert!(err.contains(expected), "{expected}: {err}");
     }
+}
+
+#[test]
+fn images_through_the_mmproj_file() {
+    use candle_transformers::models::qwen3_5_vl::{Images, VisionModel};
+    let r = load("qwen3_5/vision/reference.safetensors").unwrap();
+    let mut m = model(convert(&Hf::fixture("vision"), Opts::default()));
+    let mut f = Cursor::new(mmproj("vision"));
+    let ct = gguf_file::Content::read(&mut f).unwrap();
+    let (vision, processor) = VisionModel::from_mmproj(&ct, &mut f, &Device::Cpu).unwrap();
+    assert_eq!(processor.factor(), 8);
+    let (mut pixels, mut grids) = (vec![], vec![]);
+    for i in 0..2 {
+        let (p, g) = processor.preprocess(&r[&format!("image.{i}")]).unwrap();
+        pixels.push(p);
+        grids.push(g);
+    }
+    let pixels = Tensor::cat(&pixels, 0).unwrap();
+    assert_close(
+        &vision.forward(&pixels, &grids).unwrap(),
+        &r["vision_out"],
+        1e-4,
+        "vision",
+    );
+    let ids = r["input_ids"].to_dtype(DType::U32).unwrap();
+    let images = Images {
+        pixel_values: &pixels,
+        grids: &grids,
+    };
+    let h = m
+        .forward_prompt_hidden(&ids, Some((&vision, images)), 45)
+        .unwrap();
+    assert_close(
+        &m.logits(&h).unwrap(),
+        &r["prefill_logits"],
+        1e-4,
+        "prefill",
+    );
+    assert_eq!(m.rope_delta(), -3);
+    let l = ids.dim(1).unwrap();
+    let toks = r["decode_tokens"].to_dtype(DType::U32).unwrap();
+    for i in 0..toks.dim(1).unwrap() {
+        let logits = m.forward(&toks.narrow(1, i, 1).unwrap(), l + i).unwrap();
+        assert_close(&logits, &r[&format!("decode_logits.{i}")], 1e-4, "decode");
+    }
+    // Without images the prompt is text.
+    let a = m.forward_prompt_hidden(&ids, None, 45).unwrap();
+    assert_eq!(m.rope_delta(), 0);
+    m.clear_kv_cache();
+    assert_close(&a, &m.forward_hidden(&ids, 0).unwrap(), 0., "text");
+
+    // Other projectors and deepstack layers are refused.
+    let mut f = Cursor::new(mmproj("vision"));
+    let mut ct = gguf_file::Content::read(&mut f).unwrap();
+    ct.metadata
+        .insert("clip.projector_type".into(), Value::String("ldp".into()));
+    let err = VisionModel::from_mmproj(&ct, &mut f, &Device::Cpu)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("qwen3vl_merger"), "{err}");
+    ct.metadata.insert(
+        "clip.projector_type".into(),
+        Value::String("qwen3vl_merger".into()),
+    );
+    ct.metadata.insert(
+        "clip.vision.is_deepstack_layers".into(),
+        Value::Array(vec![Value::Bool(false), Value::Bool(true)]),
+    );
+    let err = VisionModel::from_mmproj(&ct, &mut f, &Device::Cpu)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("deepstack"), "{err}");
+    ct.metadata.remove("clip.vision.is_deepstack_layers");
+    ct.metadata.remove("clip.vision.patch_size");
+    let err = VisionModel::from_mmproj(&ct, &mut f, &Device::Cpu)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("clip.vision.patch_size"), "{err}");
 }

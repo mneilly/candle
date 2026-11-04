@@ -19,6 +19,7 @@ use super::qwen3_5::{
     chunk_gated_delta_rule, generate_mtp, recurrent_gated_delta_rule, softplus, MtpModel, MtpStats,
     RotaryEmbedding,
 };
+use super::qwen3_5_vl::{prompt_embeds, Images, VisionModel};
 use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QMatMul};
 use candle::{DType, Device, Module, Result, Tensor, D};
@@ -61,6 +62,8 @@ pub struct Config {
     pub recurrent: Vec<bool>,
     /// [`L2Norm::Max`] from [`Config::from_gguf`], for the Ternary Bonsai models.
     pub l2_norm: L2Norm,
+    /// The temporal, height and width frequency sections of multimodal RoPE.
+    pub mrope_section: Option<Vec<usize>>,
 }
 
 fn int(v: &gguf_file::Value) -> Result<i64> {
@@ -156,6 +159,17 @@ impl Config {
             head_v_dim: usize("ssm.inner_size")? / num_v_heads,
             recurrent,
             l2_norm: L2Norm::Max,
+            mrope_section: match md.get("qwen35.rope.dimension_sections") {
+                // llama.cpp stores four sections, the last one unused here.
+                Some(v) => Some(
+                    v.to_vec()?
+                        .iter()
+                        .take(3)
+                        .map(|v| Ok(int(v)? as usize))
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+                None => None,
+            },
         })
     }
 }
@@ -515,7 +529,7 @@ impl Attention {
         })
     }
 
-    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, rope: &Rope) -> Result<Tensor> {
         let (b, l, _) = xs.dims3()?;
         let (nh, nkv, hd) = (self.num_heads, self.num_kv_heads, self.head_dim);
         let (q, k, v) = match &self.qkv {
@@ -535,8 +549,12 @@ impl Attention {
         let k = self.k_norm.forward(&k.reshape((b, l, nkv, hd))?)?;
         let k = k.transpose(1, 2)?;
         let v = v.reshape((b, l, nkv, hd))?.transpose(1, 2)?.contiguous()?;
-        let q = self.rotary.apply(&q.contiguous()?, offset)?;
-        let k = self.rotary.apply(&k.contiguous()?, offset)?;
+        let q = self
+            .rotary
+            .apply_cos_sin(&q.contiguous()?, &rope.0, &rope.1)?;
+        let k = self
+            .rotary
+            .apply_cos_sin(&k.contiguous()?, &rope.0, &rope.1)?;
         let (k, v) = match &self.kv_cache {
             Some((pk, pv)) => (Tensor::cat(&[pk, &k], 2)?, Tensor::cat(&[pv, &v], 2)?),
             None => (k, v),
@@ -735,11 +753,11 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(&mut self, xs: &Tensor, mask: Option<&Tensor>, rope: &Rope) -> Result<Tensor> {
         let h = self.attn_norm.forward(xs)?;
         let h = match &mut self.mixer {
             TokenMixer::Linear(m) => m.forward(&h)?,
-            TokenMixer::Full(m) => m.forward(&h, mask, offset)?,
+            TokenMixer::Full(m) => m.forward(&h, mask, rope)?,
         };
         let xs = (xs + h)?;
         let h = self.post_norm.forward(&xs)?.apply(&self.mlp)?;
@@ -767,6 +785,9 @@ impl DecoderLayer {
         Ok(())
     }
 }
+
+/// The `(seq, rope_dim / 2)` cos and sin of the positions of a forward pass.
+type Rope = (Tensor, Tensor);
 
 #[derive(Debug, Clone)]
 enum LayerCache {
@@ -896,6 +917,10 @@ pub struct Model {
     norm: RmsNorm,
     output: QLinear,
     mtp: Vec<MtpLayer>,
+    rotary: Arc<RotaryEmbedding>,
+    /// The RoPE position of cache position `p` is `p + rope_delta`, see
+    /// [`Model::set_rope_delta`].
+    rope_delta: i64,
     device: Device,
 }
 
@@ -923,13 +948,16 @@ impl Model {
             hadamard: Hadamard::from_gguf(ct, device)?,
             eps: cfg.rms_norm_eps as f32,
         };
-        let rotary = Arc::new(RotaryEmbedding::new_partial(
-            DType::F32,
-            cfg.rope_dim,
-            cfg.rope_theta,
-            cfg.max_position_embeddings,
-            device,
-        )?);
+        let rotary = Arc::new(
+            RotaryEmbedding::new_partial(
+                DType::F32,
+                cfg.rope_dim,
+                cfg.rope_theta,
+                cfg.max_position_embeddings,
+                device,
+            )?
+            .with_mrope_section(cfg.mrope_section.clone()),
+        );
         let embed = Embedding::new(&mut w, "token_embd.weight")?;
         let layers = (0..cfg.num_hidden_layers)
             .map(|i| {
@@ -952,6 +980,8 @@ impl Model {
             norm,
             output,
             mtp,
+            rotary,
+            rope_delta: 0,
             device: device.clone(),
         })
     }
@@ -968,13 +998,89 @@ impl Model {
     /// The `(batch, seq, hidden)` final hidden states of `input` `(batch, seq)` after `offset`
     /// already-processed tokens.
     pub fn forward_hidden(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
-        let (_, l) = input.dims2()?;
+        let embeds = self.embed(input)?;
+        self.forward_embeds(&embeds, offset, None)
+    }
+
+    /// The `(batch, seq, hidden)` token embeddings of `input`.
+    pub fn embed(&self, input: &Tensor) -> Result<Tensor> {
+        self.embed.forward(input)
+    }
+
+    /// Runs `(batch, seq, hidden)` input embeddings after `offset` cached positions, with the
+    /// temporal, height and width RoPE positions of images when given; see
+    /// [`super::qwen3_5::Model::forward_embeds`].
+    pub fn forward_embeds(
+        &mut self,
+        embeds: &Tensor,
+        offset: usize,
+        positions: Option<&[Vec<u32>; 3]>,
+    ) -> Result<Tensor> {
+        let (_, l, _) = embeds.dims3()?;
         let mask = self.causal_mask(l, offset)?;
-        let mut xs = self.embed.forward(input)?;
+        let rope = self.rope(l, offset, positions)?;
+        let mut xs = embeds.clone();
         for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, mask.as_ref(), offset)?;
+            xs = layer.forward(&xs, mask.as_ref(), &rope)?;
         }
         self.norm.forward(&xs)
+    }
+
+    fn rope(&self, l: usize, offset: usize, positions: Option<&[Vec<u32>; 3]>) -> Result<Rope> {
+        match positions {
+            Some(p) => {
+                if p.iter().any(|p| p.len() != l) {
+                    candle::bail!("expected {l} positions per axis")
+                }
+                self.rotary.mrope_cos_sin(p)
+            }
+            None => {
+                let start = offset as i64 + self.rope_delta;
+                if start < 0 {
+                    candle::bail!("negative RoPE position {start}")
+                }
+                self.rotary.cos_sin(start as usize, l)
+            }
+        }
+    }
+
+    /// Runs a `(1, seq)` prompt from cleared caches, its image tokens `image_token_id` replaced
+    /// by the embeddings of `images` from the vision tower of an `mmproj` file, and returns the
+    /// final hidden states. Later steps take [`Model::forward`] at the next cache position.
+    pub fn forward_prompt_hidden(
+        &mut self,
+        ids: &Tensor,
+        images: Option<(&VisionModel, Images<'_>)>,
+        image_token_id: u32,
+    ) -> Result<Tensor> {
+        self.clear_kv_cache();
+        let embeds = self.embed(ids)?;
+        let Some((vision, images)) = images else {
+            return self.forward_embeds(&embeds, 0, None);
+        };
+        let image_embeds = vision.forward(images.pixel_values, images.grids)?;
+        let merge = vision.config().spatial_merge_size;
+        let (embeds, positions, delta) = prompt_embeds(
+            ids,
+            &embeds,
+            &image_embeds,
+            images.grids,
+            image_token_id,
+            merge,
+        )?;
+        let hidden = self.forward_embeds(&embeds, 0, Some(&positions))?;
+        self.rope_delta = delta;
+        Ok(hidden)
+    }
+
+    /// Sets the shift between cache positions and RoPE positions after a multimodal prompt; it
+    /// is reset by [`Model::clear_kv_cache`].
+    pub fn set_rope_delta(&mut self, delta: i64) {
+        self.rope_delta = delta
+    }
+
+    pub fn rope_delta(&self) -> i64 {
+        self.rope_delta
     }
 
     /// The LM head applied to normed hidden states.
@@ -997,6 +1103,7 @@ impl Model {
 
     /// Clears the KV caches and the recurrent states, to start a new sequence.
     pub fn clear_kv_cache(&mut self) {
+        self.rope_delta = 0;
         let layers = self.layers.iter_mut();
         for layer in layers.chain(self.mtp.iter_mut().map(|m| &mut m.layer)) {
             match &mut layer.mixer {
@@ -1054,6 +1161,7 @@ impl Model {
         }
         let (_, l) = ids.dims2()?;
         let mask = self.causal_mask(l, offset)?;
+        let rope = self.rope(l, offset, None)?;
         let n = self.mtp.len();
         let embeds = match &self.mtp[step % n].embed {
             Some(e) => e.forward(ids)?,
@@ -1063,7 +1171,7 @@ impl Model {
         let e = m.enorm.forward(&embeds)?;
         let h = m.hnorm.forward(hidden)?;
         let xs = Tensor::cat(&[e, h], D::Minus1)?.apply(&m.eh_proj)?;
-        let xs = m.layer.forward(&xs, mask.as_ref(), offset)?;
+        let xs = m.layer.forward(&xs, mask.as_ref(), &rope)?;
         match &m.head_norm {
             Some(norm) => norm.forward(&xs),
             None => self.norm.forward(&xs),

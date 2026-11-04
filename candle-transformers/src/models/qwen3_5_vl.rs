@@ -399,6 +399,105 @@ impl VisionModel {
     pub fn config(&self) -> &VisionConfig {
         &self.cfg
     }
+
+    /// Loads the vision tower of a llama.cpp `mmproj` GGUF file (projector `qwen3vl_merger`),
+    /// with the image normalization it stores.
+    pub fn from_mmproj<R: std::io::Read + std::io::Seek>(
+        ct: &candle::quantized::gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<(Self, ImageProcessor)> {
+        let md = &ct.metadata;
+        let get = |k: &str| match md.get(k) {
+            Some(v) => Ok(v),
+            None => candle::bail!("cannot find {k} in the mmproj metadata"),
+        };
+        let int = |k: &str| -> Result<usize> { Ok(get(k)?.to_u64()? as usize) };
+        let projector = get("clip.projector_type")
+            .or_else(|_| get("clip.vision.projector_type"))?
+            .to_string()?;
+        if projector != "qwen3vl_merger" {
+            candle::bail!("expected a qwen3vl_merger projector, got {projector}")
+        }
+        if let Some(v) = md.get("clip.vision.is_deepstack_layers") {
+            if v.to_vec()?.iter().any(|v| v.to_bool().unwrap_or(false)) {
+                candle::bail!("deepstack layers are not supported")
+            }
+        }
+        let floats = |k: &str| -> Result<[f32; 3]> {
+            let v = get(k)?.to_vec()?;
+            if v.len() != 3 {
+                candle::bail!("expected 3 values for {k}")
+            }
+            Ok([v[0].to_f32()?, v[1].to_f32()?, v[2].to_f32()?])
+        };
+        let patch_size = int("clip.vision.patch_size")?;
+        let side = int("clip.vision.image_size")? / patch_size;
+        let cfg = VisionConfig {
+            depth: int("clip.vision.block_count")?,
+            hidden_size: int("clip.vision.embedding_length")?,
+            hidden_act: Activation::GeluPytorchTanh,
+            intermediate_size: int("clip.vision.feed_forward_length")?,
+            num_heads: int("clip.vision.attention.head_count")?,
+            in_channels: 3,
+            patch_size,
+            spatial_merge_size: int("clip.vision.spatial_merge_size")?,
+            temporal_patch_size: 2,
+            out_hidden_size: int("clip.vision.projection_dim")?,
+            num_position_embeddings: side * side,
+            rope_parameters: None,
+        };
+        let mut processor = ImageProcessor::new(&cfg);
+        processor.image_mean = floats("clip.vision.image_mean")?;
+        processor.image_std = floats("clip.vision.image_std")?;
+
+        // The tensors under the names of the transformers checkpoint.
+        let mut t = std::collections::HashMap::new();
+        let mut read =
+            |name: &str| -> Result<Tensor> { ct.tensor(reader, name, device)?.dequantize(device) };
+        // The 3D patch convolution is stored as one 2D convolution per frame.
+        let frames = [read("v.patch_embd.weight")?, read("v.patch_embd.weight.1")?];
+        t.insert(
+            "patch_embed.proj.weight".to_string(),
+            Tensor::stack(&frames, 2)?,
+        );
+        t.insert(
+            "patch_embed.proj.bias".to_string(),
+            read("v.patch_embd.bias")?,
+        );
+        t.insert(
+            "pos_embed.weight".to_string(),
+            read("v.position_embd.weight")?,
+        );
+        for i in 0..cfg.depth {
+            for (g, h) in [
+                ("ln1", "norm1"),
+                ("ln2", "norm2"),
+                ("attn_qkv", "attn.qkv"),
+                ("attn_out", "attn.proj"),
+                ("ffn_up", "mlp.linear_fc1"),
+                ("ffn_down", "mlp.linear_fc2"),
+            ] {
+                for p in ["weight", "bias"] {
+                    t.insert(
+                        format!("blocks.{i}.{h}.{p}"),
+                        read(&format!("v.blk.{i}.{g}.{p}"))?,
+                    );
+                }
+            }
+        }
+        for (g, h) in [
+            ("v.post_ln", "merger.norm"),
+            ("mm.0", "merger.linear_fc1"),
+            ("mm.2", "merger.linear_fc2"),
+        ] {
+            for p in ["weight", "bias"] {
+                t.insert(format!("{h}.{p}"), read(&format!("{g}.{p}"))?);
+            }
+        }
+        let vb = VarBuilder::from_tensors(t, DType::F32, device);
+        Ok((Self::new(&cfg, vb)?, processor))
+    }
 }
 
 /// The multimodal RoPE positions of a prompt whose image tokens stand for the images of `grids`,
@@ -447,6 +546,41 @@ pub fn rope_positions(
         candle::bail!("fewer images in the prompt than given")
     }
     Ok((pos, next as i64 - ids.len() as i64))
+}
+
+/// The inputs of a `(1, seq)` prompt with images: its token embeddings `(1, seq, hidden)` with
+/// the image tokens replaced by the `(tokens, hidden)` image embeddings, in order, their RoPE
+/// positions and the shift of the later positions, see [`rope_positions`].
+pub fn prompt_embeds(
+    ids: &Tensor,
+    embeds: &Tensor,
+    image_embeds: &Tensor,
+    grids: &[Grid],
+    image_token_id: u32,
+    merge: usize,
+) -> Result<(Tensor, [Vec<u32>; 3], i64)> {
+    let tokens = ids.squeeze(0)?.to_vec1::<u32>()?;
+    let (positions, delta) = rope_positions(&tokens, grids, image_token_id, merge)?;
+    let n_image = tokens.iter().filter(|&&t| t == image_token_id).count();
+    if image_embeds.dim(0)? != n_image {
+        candle::bail!(
+            "{n_image} image tokens for {} image embeddings",
+            image_embeds.dim(0)?
+        )
+    }
+    let text_rows = embeds.squeeze(0)?;
+    let image_embeds = image_embeds.to_dtype(text_rows.dtype())?;
+    let mut rows = Vec::with_capacity(tokens.len());
+    let mut next_image = 0;
+    for (i, &t) in tokens.iter().enumerate() {
+        if t == image_token_id {
+            rows.push(image_embeds.get(next_image)?);
+            next_image += 1;
+        } else {
+            rows.push(text_rows.get(i)?);
+        }
+    }
+    Ok((Tensor::stack(&rows, 0)?.unsqueeze(0)?, positions, delta))
 }
 
 /// The language model with an optional vision tower.
@@ -503,7 +637,7 @@ impl Model {
         images: Option<Images<'_>>,
     ) -> Result<Tensor> {
         self.text.clear_kv_cache();
-        let mut embeds = self.text.embed(ids)?;
+        let embeds = self.text.embed(ids)?;
         let Some(Images {
             pixel_values,
             grids,
@@ -515,24 +649,15 @@ impl Model {
             candle::bail!("the model was loaded without its vision tower")
         };
         let image_embeds = vision.forward(pixel_values, grids)?;
-        let tokens = ids.squeeze(0)?.to_vec1::<u32>()?;
         let merge = self.cfg.vision.spatial_merge_size;
-        let (positions, delta) = rope_positions(&tokens, grids, self.cfg.image_token_id, merge)?;
-        // The image tokens take the image embeddings, in order.
-        let mut rows = Vec::with_capacity(tokens.len());
-        let mut next_image = 0;
-        let text_rows = embeds.squeeze(0)?;
-        for (i, &t) in tokens.iter().enumerate() {
-            if t == self.cfg.image_token_id {
-                rows.push(image_embeds.get(next_image)?);
-                next_image += 1;
-            } else {
-                rows.push(text_rows.get(i)?);
-            }
-        }
-        embeds = Tensor::stack(&rows, 0)?
-            .to_dtype(embeds.dtype())?
-            .unsqueeze(0)?;
+        let (embeds, positions, delta) = prompt_embeds(
+            ids,
+            &embeds,
+            &image_embeds,
+            grids,
+            self.cfg.image_token_id,
+            merge,
+        )?;
         let hidden = self.text.forward_embeds(&embeds, 0, Some(&positions))?;
         self.text.set_rope_delta(delta);
         Ok(hidden)

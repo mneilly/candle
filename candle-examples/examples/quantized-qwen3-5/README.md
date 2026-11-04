@@ -18,6 +18,15 @@ $ cargo run --example quantized-qwen3-5 --release -- \
 decodes greedily with the MTP layers drafting `N` tokens per step, which the model checks in one
 pass; without it, `--temperature` and `--top-p` sample.
 
+Images need the vision tower, which llama.cpp ships as a separate `mmproj` GGUF file: pass it
+with `--mmproj` (a local path or a file of `--repo`) and each image with `--image`. The tower is
+read only when there are images.
+
+```bash
+$ cargo run --example quantized-qwen3-5 --release -- --file <model .gguf> --mmproj <mmproj .gguf> \
+    --image candle-examples/examples/yolo-v8/assets/bike.jpg --prompt "Describe this image."
+```
+
 The ternary types run on the CPU only for now. The context length of the file sizes the RoPE
 tables; `--max-context` caps it.
 

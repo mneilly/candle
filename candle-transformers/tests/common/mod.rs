@@ -1,6 +1,8 @@
 //! Helpers shared by the tests that compare against the golden fixtures of `tests/fixtures`.
 #![allow(dead_code)]
 
+pub mod qwen35_gguf;
+
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
